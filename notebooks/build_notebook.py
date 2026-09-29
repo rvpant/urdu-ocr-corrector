@@ -144,9 +144,27 @@ code("""
 # Colab: A100 40GB. Check what we actually got -- Colab silently downgrades.
 !nvidia-smi --query-gpu=name,memory.total --format=csv
 
+# Install ONLY what Colab lacks. pillow/matplotlib/pandas/scipy/numpy ship with
+# the runtime already, and `-U` on them is actively harmful: Colab's base image
+# does not replace every file atomically, so upgrading pillow in place leaves a
+# new ImageDraw.py against a stale _typing.py and the next import dies with
+#   ImportError: cannot import name '_Ink' from 'PIL._typing'
+# Nothing here needs a newer pillow than the runtime provides.
 %pip -q install -U "transformers>=4.57" "trl>=0.24" "peft>=0.17" "datasets>=3.0" \\
-    "accelerate>=1.0" "bitsandbytes>=0.44" jiwer pillow matplotlib pandas scipy
-print("\\nRestart the runtime if transformers was already imported this session.")
+    "accelerate>=1.0" "bitsandbytes>=0.44" jiwer
+
+import PIL, importlib
+print("pillow", PIL.__version__, "(runtime default, deliberately not upgraded)")
+try:
+    from PIL import ImageDraw, ImageFilter          # the imports that break when split
+    importlib.import_module("PIL._typing")
+    print("pillow imports clean")
+except ImportError as e:
+    raise SystemExit(
+        f"pillow is in a half-upgraded state: {e}\\n"
+        "Runtime -> Restart session, then run this cell again. Re-installing "
+        "will not help; the stale module is already loaded in this process.")
+print("\\nIf transformers was imported earlier this session, restart the runtime.")
 """)
 
 md("""
