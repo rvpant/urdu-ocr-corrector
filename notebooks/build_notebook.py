@@ -127,6 +127,14 @@ the notebook says so rather than burning an hour finding out.
 
 ---
 **Runtime:** A100 40GB (Colab Pro). Set Runtime → Change runtime type → A100.
+
+**Hugging Face access is required.** The splits are private datasets, so an
+anonymous `load_dataset` returns HTTP 401, which `datasets` reports as the
+misleading *"Dataset ... doesn't exist on the Hub or cannot be accessed"*. §1
+resolves a token before anything else runs. Easiest path: Colab's 🔑 sidebar →
+add a secret named `HF_TOKEN` (a read token from
+[hf.co/settings/tokens](https://huggingface.co/settings/tokens)) → enable
+notebook access. It then persists across sessions.
 """)
 
 # ---------------------------------------------------------------- install
@@ -140,6 +148,89 @@ code("""
     "accelerate>=1.0" "bitsandbytes>=0.44" jiwer pillow matplotlib pandas scipy
 print("\\nRestart the runtime if transformers was already imported this session.")
 """)
+
+md("""
+### 1a · Hugging Face access
+
+The splits are private. Without a token `load_dataset` gets HTTP 401 and reports
+it as *"doesn't exist on the Hub or cannot be accessed"* — which reads like a
+typo in the dataset name and is not. Resolved here so it fails in 5 seconds
+rather than after the model has loaded.
+""")
+
+code('''
+import os
+
+def _cached_token():
+    """Token from the huggingface-cli cache, across library versions.
+
+    `HfFolder.get_token()` was the old spelling and is gone in current
+    huggingface_hub; `get_token()` is the replacement. Try the new name first
+    and fall back, so this works on whatever Colab happens to install.
+    """
+    try:
+        from huggingface_hub import get_token
+        return get_token()
+    except ImportError:
+        pass
+    try:
+        from huggingface_hub import HfFolder
+        return HfFolder.get_token()
+    except Exception:
+        return None
+
+def resolve_hf_token():
+    """Colab secret -> environment -> cli cache -> interactive login. First hit wins."""
+    try:                                    # Colab Secrets (persists across sessions)
+        from google.colab import userdata
+        t = userdata.get("HF_TOKEN")
+        if t: print("token source: Colab secret HF_TOKEN"); return t.strip()
+    except Exception:
+        pass
+    for var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACEHUB_API_TOKEN"):
+        if os.environ.get(var):
+            print(f"token source: ${var}"); return os.environ[var].strip()
+    t = _cached_token()
+    if t: print("token source: huggingface-cli cache"); return t.strip()
+    print("no token found -- opening interactive login")
+    from huggingface_hub import notebook_login
+    notebook_login()
+    t = _cached_token()
+    if not t:
+        raise RuntimeError("login did not produce a token; add a Colab secret "
+                           "named HF_TOKEN instead (sidebar key icon)")
+    return t.strip()
+
+HF_TOKEN = resolve_hf_token()
+os.environ["HF_TOKEN"] = HF_TOKEN or ""     # datasets/transformers also read this
+
+# Verify against the dataset we actually need, not just "is the token valid".
+# A valid token belonging to the wrong account fails exactly here, with a
+# message that says so.
+from huggingface_hub import HfApi
+_api = HfApi(token=HF_TOKEN)
+print("logged in as:", _api.whoami().get("name", "?"))
+''')
+
+code('''
+DATASET_ID = "rpant/ocr-urdu-splits-hr"     # must match CFG["dataset_id"] in section 2
+try:
+    info = _api.dataset_info(DATASET_ID)
+    print(f"OK  {info.id}  private={info.private}  files={len(info.siblings)}")
+except Exception as e:
+    raise SystemExit(
+        f"cannot reach {DATASET_ID}: {type(e).__name__}: {e}\\n\\n"
+        "Checklist:\\n"
+        f"  1. Does it exist?  https://huggingface.co/datasets/{DATASET_ID}\\n"
+        "  2. Is your token from the account that owns it (printed above)?\\n"
+        "  3. Does the token have read scope?\\n"
+        "  4. In Colab: sidebar key icon -> HF_TOKEN -> 'Notebook access' toggled ON.\\n"
+        "  5. Not built yet? Run, from the repo:\\n"
+        "     uv run python data_prep/package_dataset.py --image-source high "
+        "--out packaged_dataset_hr\\n"
+        "     uv run python data_prep/make_splits.py --dataset packaged_dataset_hr "
+        f"--out splits_dataset_hr --push-to-hub {DATASET_ID} --private")
+''')
 
 code("""
 import os, json, math, time, random, gc, re, unicodedata, io, base64
@@ -363,7 +454,12 @@ between these three is the one error that would invalidate every number below.
 code('''
 from datasets import load_dataset
 
-SPLITS = {s: load_dataset(CFG["dataset_id"], split=s) for s in ["sft_train","rl_train","test"]}
+assert CFG["dataset_id"] == DATASET_ID, (
+    f"section 1a verified access to {DATASET_ID!r} but CFG points at "
+    f"{CFG['dataset_id']!r} -- update both or the check was meaningless")
+
+SPLITS = {s: load_dataset(CFG["dataset_id"], split=s, token=HF_TOKEN)
+          for s in ["sft_train","rl_train","test"]}
 ids = {k: set(v["doc_id"]) for k,v in SPLITS.items()}
 for a in ids:
     for b in ids:
