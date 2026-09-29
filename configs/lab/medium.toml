@@ -1,0 +1,52 @@
+# 300-step iteration run. Only launch this after smoke.toml showed reward
+# moving and the section 8 watchlist metrics behaving.
+#
+# Launch:  prime train configs/lab/medium.toml
+name = "ocr-corrector-medium"
+model = "Qwen/Qwen3.5-4B"
+
+max_steps = 300
+batch_size = 256
+rollouts_per_example = 16
+
+[sampling]
+max_tokens = 3072
+temperature = 0.7
+
+[[env]]
+id = "rpant/ocr-corrector"
+args = { dataset_id = "rpant/ocr-corrector-ur", image_upscale = 4 }
+
+[wandb]
+project = "ocr-corrector"
+name = "qwen35-4b-medium"
+
+[eval]
+interval = 50
+num_examples = 64
+rollouts_per_example = 1
+
+[[eval.env]]
+id = "rpant/ocr-corrector"
+args = { dataset_id = "rpant/ocr-corrector-ur", image_upscale = 4 }
+
+[val]
+interval = 10
+num_examples = 32
+rollouts_per_example = 1
+
+# Drop example groups whose rollouts all score the same, so the step spends its
+# budget on documents where GRPO has advantage signal. This directly targets the
+# weak-signal risk in INIT.md 6.4: a document whose baseline is already at the
+# achievable ceiling has no recoverable error, every rollout scores ~0, and the
+# group contributes nothing but noise.
+#
+# INIT.md specifies `[buffer] online_difficulty_filtering = true`. That key was
+# removed in the orch v2 rename and the config schema now rejects unknown keys,
+# so it would fail validation before the run starts. `zero_advantage` as a
+# pre-batch filter is its documented replacement.
+[[pre_batch_filters]]
+type = "zero_advantage"
+enforce = true
+
+# Hosted Training docs: https://docs.primeintellect.ai/hosted-training

@@ -1,0 +1,62 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+# Lab generated artifacts
+.env
+/outputs/
+/prime-rl/
+/environments/*/outputs/
+/environments/*/dist/
+/environments/*/*.egg-info/
+/environments/*/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+# Working notes / reports
+/implementation_v1.md
+/RL_report_v1.md
+/RL_review_v1.md
+
+# Built data artifacts. Globbed, not enumerated: the previous list named exactly
+# `/packaged_dataset/` and `/splits_dataset/`, so the high-res variants
+# (`packaged_dataset_hr/`, `splits_dataset_hr/`) were tracked by default -- 508 MB
+# of Arrow, past GitHub's 100 MB per-file hard limit. All of it is reproducible
+# from data_prep/ plus the Hub datasets, so none of it belongs in git.
+/hf_dataset*/
+/packaged_dataset*/
+/splits_dataset*/
+/baselines*.jsonl
+/splits_manifest.json
+*.arrow
+
+# Source corpus: the Urdu Newspaper Benchmark (829 paragraph images, 9,982
+# lines) from arXiv:2505.13943 -- 174 MB of third-party research data across
+# 2,491 files. Not ours to redistribute, and the packaged form already lives on
+# the Hub as rpant/ocr-corrector-ur{,-hr}. Provenance is documented in
+# RL_review_v1.md section 3.3. Remove this line if you decide to vendor it.
+/data/
+
+# macOS
+.DS_Store
+
+# Lab generated artifacts
+/AGENTS.md
+/CLAUDE.md
+/CLAUDE.local.md
+/.prime/
+/.agents/skills/
+/.claude/skills/
+/.cursor/skills/
+/.factory/skills/
+/.grok/skills/
+/.opencode/skills/
+/.pi/skills/
+/environments/AGENTS.md
+

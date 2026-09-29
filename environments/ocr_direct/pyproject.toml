@@ -1,0 +1,24 @@
+[project]
+name = "ocr-direct"
+description = "Direct OCR of low-resolution Urdu document images, scored by character error rate against human transcriptions."
+tags = ["single-turn", "multimodal", "ocr", "urdu", "train", "eval"]
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "verifiers>=0.1.14",
+    "datasets>=2.16.0",
+    "jiwer>=4.0.0",
+    "Pillow>=10.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["ocr_direct.py", "pyproject.toml"]
+
+[tool.verifiers.eval]
+num_examples = 5
+rollouts_per_example = 2
+max_tokens = 3072

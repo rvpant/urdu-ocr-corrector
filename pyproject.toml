@@ -1,0 +1,16 @@
+[project]
+name = "ocr-corrector"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "verifiers>=0.1.14",
+]
+
+[dependency-groups]
+dev = [
+    "jiwer>=4.0.0",
+    "pillow>=12.3.0",
+    "tqdm>=4.67.3",
+]

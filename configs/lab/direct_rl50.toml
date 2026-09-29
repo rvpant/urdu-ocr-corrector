@@ -1,0 +1,80 @@
+# 50-step diagnostic RL run. Purpose is to understand the dynamics, not to ship
+# an adapter. Follows a 100-step attempt that was stopped at step 29 after the
+# policy drifted into over-generation and then collapsed.
+#
+#   export HF_TOKEN=$(cat ~/.cache/huggingface/token)
+#   prime train configs/lab/direct_rl50.toml -e HF_TOKEN
+#
+# WHAT WENT WRONG LAST TIME
+#   step  m_cer  len_ratio  out_tok  m_empty  reward
+#      1  0.337      0.925      214    0.000   0.663
+#     20  0.491      2.169      473    0.000   0.400
+#     23  0.585      1.965      684    0.000   0.258
+#     25  0.690      0.490      146    0.515   0.308   <- collapse
+# CER tracked length almost exactly. The policy learned to write more, not to
+# read better, then whipsawed into emitting nothing at all.
+#
+# WHAT CHANGED (all in the environment, see ocr_direct.py)
+#   1. The -0.5 length cliff outside [0.4, 2.0] is gone. It was flat inside the
+#      band (no restoring force while drifting 0.93 -> 2.0) and a sheer wall at
+#      the edge (whipsaw into empty). Replaced by -0.1 * |ln(ratio)|: zero at
+#      ratio 1.0, smooth and symmetric, always pointing home, and far too weak
+#      to be worth gaming.
+#   2. CER cap raised 1.0 -> 1.5. At cap 1.0 an output 2x too long and one 4x
+#      too long both scored 1.0, so past ~2x, extra garbage was free. Rewards
+#      are now monotonic in length: 1.5x -> 0.11, 2x -> -0.09, 3x -> -0.61.
+#   3. New metrics m_sub_rate / m_del_rate / m_ins_rate decompose CER. This is
+#      the run's real instrument: over-generation appears ONLY in insertions,
+#      misreading glyphs ONLY in substitutions. If m_sub_rate falls, the model
+#      is genuinely reading better. If m_cer moves only via m_ins_rate, it is
+#      gaming length again and RL on this task is not viable as shaped.
+#
+# NOT CHANGED ON PURPOSE: learning rate is left at the platform default. The
+# drift was smooth and directed rather than random, which points at reward shape
+# rather than step size, and changing both at once would make the result
+# uninterpretable. If the policy still drifts with a sane reward, learning_rate
+# is the next lever and we will have clean evidence for it.
+name = "ocr-direct-rl50"
+model = "Qwen/Qwen3.5-4B"
+
+max_steps = 50
+batch_size = 128
+rollouts_per_example = 8
+max_inflight_rollouts = 64
+
+[sampling]
+max_tokens = 1536
+temperature = 0.7
+enable_thinking = false   # REQUIRED: overrides the env; without it, 100% truncation
+
+[[env]]
+id = "rpant/ocr-direct"
+args = { dataset_id = "rpant/ocr-corrector-ur", image_upscale = 4 }
+
+# Degenerate-rollout containment. Both filters ship enabled but in MONITORING
+# mode by default, so last run they observed the collapse without acting on it.
+# Enforcing them drops degenerate rollouts before they reach the batch, which
+# breaks the feedback loop where a collapsing policy trains on its own garbage.
+[[post_batch_filters]]
+type = "repetition"
+enforce = true
+
+[[post_batch_filters]]
+type = "gibberish"
+enforce = true
+
+[eval]
+interval = 25
+num_examples = 32
+rollouts_per_example = 1
+
+[[eval.env]]
+id = "rpant/ocr-direct"
+args = { dataset_id = "rpant/ocr-corrector-ur", image_upscale = 4 }
+
+[val]
+interval = 10
+num_examples = 32
+rollouts_per_example = 1
+
+# Hosted Training docs: https://docs.primeintellect.ai/hosted-training

@@ -1,0 +1,74 @@
+# 100-step RL-only run on direct OCR. The first run intended to actually learn
+# something rather than test plumbing.
+#
+#   export HF_TOKEN=$(cat ~/.cache/huggingface/token)
+#   prime train configs/lab/direct_rl100.toml -e HF_TOKEN
+#
+# WHAT TO EXPECT
+# Baseline (greedy, temp 0) is CER 0.262 on these documents. pass@16 at temp 0.7
+# gives best-of-16 = 0.247, and best-of-k is roughly the ceiling RL can sharpen
+# toward -- GRPO concentrates probability on modes the policy already samples,
+# it does not invent new ones. So a good outcome here is m_cer drifting from
+# ~0.33 (temp 0.7 mean) toward ~0.25, not toward the 0.022 a frontier VLM gets.
+# Closing that larger gap needs distillation, not RL.
+#
+# COST BOUND (see the arithmetic in README.md)
+# 100 steps x 128 rollouts = 12,800 rollouts. Measured on the probe run at
+# $0.000375/rollout => ~$5. The hard ceiling, if every single rollout ran to the
+# full max_tokens instead of the measured 216-token mean, is ~$15. max_tokens
+# and max_steps x batch_size are both fixed, so that ceiling cannot be exceeded.
+name = "ocr-direct-rl100"
+model = "Qwen/Qwen3.5-4B"
+
+max_steps = 100
+batch_size = 128
+rollouts_per_example = 8      # => 16 unique documents per step, ~2.1 epochs over 746
+
+# Cap concurrent generation. The first attempt at this run left this unset, so
+# all 128 rollouts were in flight at once; each carried a ~468KB base64 PNG,
+# putting ~98MB of payload on the wire simultaneously and producing a 47%
+# ModelError rate (the 16-rollout probe, ~7MB, saw zero errors). With JPEG
+# encoding now in the environment (468KB -> 133KB mean) and 64 in flight, that
+# figure drops to ~8.5MB -- an 11x reduction. Must be >= rollouts_per_example.
+max_inflight_rollouts = 64
+
+[sampling]
+# Measured mean output on this env is 216 tokens; the longest ground truth in
+# the corpus is ~2.5k characters. 1536 leaves headroom while capping worst-case
+# spend.
+max_tokens = 1536
+temperature = 0.7
+
+# REQUIRED -- do not remove. The trainer's sampling config overrides whatever
+# load_environment sets, so the environment's own thinking switch is ignored
+# here. Without this line the probe run hit 100% truncation at step 1: Qwen3.5's
+# thinking mode loops on ambiguous glyphs, never emits a transcription, and
+# scores a flat -0.5 (pure length-guardrail penalty). It also triples cost.
+enable_thinking = false
+
+[[env]]
+id = "rpant/ocr-direct"
+args = { dataset_id = "rpant/ocr-corrector-ur", image_upscale = 4 }
+
+# Held-out test split, so the headline number is not measured on training data.
+# 2 evals x 32 rollouts is negligible against the training budget.
+[eval]
+interval = 50
+num_examples = 32
+rollouts_per_example = 1
+
+[[eval.env]]
+id = "rpant/ocr-direct"
+args = { dataset_id = "rpant/ocr-corrector-ur", image_upscale = 4 }
+
+[val]
+interval = 20
+num_examples = 32
+rollouts_per_example = 1
+
+# NOTE: the zero_advantage pre-batch filter is already enforced by the platform
+# default (confirmed in the probe run logs), so it is not restated here. The
+# gibberish and repetition filters run in monitoring mode by default; worth
+# promoting repetition to enforce=true if looping reappears at longer horizons.
+
+# Hosted Training docs: https://docs.primeintellect.ai/hosted-training

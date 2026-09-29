@@ -1,0 +1,46 @@
+# Two-step SFT probe. Verifies the path works before spending on a real run.
+#
+#   export HF_TOKEN=$(cat ~/.cache/huggingface/token)
+#   prime train configs/lab/sft_probe.toml -e HF_TOKEN -e PRIME_API_KEY
+#
+# Three things are unverified and each has burned us before when a config
+# validated but did not run:
+#   1. hosted SFT accepting an image-bearing environment (RL is confirmed;
+#      SFT routes generation through a different path)
+#   2. [teacher.client] reaching an external OpenAI-compatible endpoint
+#   3. a Gemini teacher receiving the multimodal prompt intact
+#
+# 2 steps x 16 = 32 teacher generations. At the measured $0.28/1k, that is
+# about $0.01. Cheaper than being wrong.
+name = "ocr-sft-probe"
+model = "Qwen/Qwen3.5-4B"
+loss = "sft"
+
+max_steps = 2
+batch_size = 16
+rollouts_per_example = 1   # SFT needs one teacher demonstration per example,
+                           # not a GRPO group. Leaving this at 8 would multiply
+                           # teacher spend eightfold for no benefit.
+
+[teacher]
+# Measured on 10 held-out documents at 4x JPEG: CER 0.024, versus 0.021 for
+# gemini-3-flash at 5x the price. The student is at 0.25, so a 0.003 difference
+# in teacher quality is far below what matters.
+model = "google/gemini-2.5-flash-lite"
+
+[teacher.client]
+base_url = "https://api.pinference.ai/api/v1"
+api_key_var = "PRIME_API_KEY"
+
+[teacher.sampling]
+max_tokens = 1536
+temperature = 0.0   # deterministic demonstrations; this is imitation, not exploration
+
+[sampling]
+max_tokens = 1536
+temperature = 0.7
+enable_thinking = false
+
+[[env]]
+id = "rpant/ocr-direct"
+args = { dataset_id = "rpant/ocr-corrector-ur", image_upscale = 4 }

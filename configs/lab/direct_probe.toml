@@ -1,0 +1,43 @@
+# Minimal hosted run. Purpose is NOT to learn anything about OCR -- it is to
+# settle whether hosted training can run a multimodal environment at all.
+#
+# The docs say VLM training needs `model.impl = "custom"` and a registered
+# PrimeRL VLM class (Qwen3.5 qualifies), but the hosted config schema exposes
+# `model` only as a bare string with no impl/vlm field. Whether the backend
+# wires that up is unverified, and it blocks every path we have -- RL, SFT,
+# and SFT-then-RL alike. Cheapest possible way to find out.
+#
+# 5 steps x 16 rollouts x ~300 output tokens. Order of a dollar.
+#
+#   prime train configs/lab/direct_probe.toml
+#
+# Watch for: does it get past environment startup and produce rollouts with
+# non-zero transcription_accuracy? If m_empty is 1.0 or the run dies during
+# env init, the image content parts are not surviving the trainer's pipeline.
+name = "ocr-direct-vlm-probe"
+model = "Qwen/Qwen3.5-4B"
+
+max_steps = 5
+batch_size = 16
+rollouts_per_example = 8
+
+[sampling]
+# Direct OCR needs far less than the correction task: no reasoning block, and
+# the ground truth tops out around 2.5k characters. Measured mean output on
+# this env is 294 tokens.
+max_tokens = 1536
+temperature = 0.7
+
+# REQUIRED. The trainer's sampling config overrides whatever load_environment
+# sets, exactly as `prime eval run` does -- so the env's
+# extra_body.chat_template_kwargs is ignored here. Without this line the first
+# probe run hit 100% truncation at step 1 and 87.5% at step 2: Qwen3.5's
+# thinking mode ran away re-litigating single glyphs and never emitted a
+# transcription, scoring reward -0.5 (pure length-guardrail penalty).
+enable_thinking = false
+
+[[env]]
+id = "rpant/ocr-direct"
+args = { dataset_id = "rpant/ocr-corrector-ur", image_upscale = 4 }
+
+# Hosted Training docs: https://docs.primeintellect.ai/hosted-training

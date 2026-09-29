@@ -1,0 +1,32 @@
+# 50-step validation run. Purpose is to prove the plumbing and see whether
+# reward moves at all -- not to produce a usable adapter.
+#
+# Launch:  prime train configs/lab/smoke.toml
+#
+# Qwen3.5-4B rather than the 9B in INIT.md: 9B is listed as available for
+# hosted training but does not respond on Prime Inference (100-230s timeouts),
+# and the frozen first pass has to run there. Keeping both roles on 4B holds
+# INIT.md 3.2's one-model-two-roles property.
+name = "ocr-corrector-smoke"
+model = "Qwen/Qwen3.5-4B"
+
+max_steps = 50
+batch_size = 64
+rollouts_per_example = 8
+
+[sampling]
+# Enough for a reasoning block plus a full transcription; ground truth reaches
+# ~2.5k characters on the longest documents in this corpus.
+max_tokens = 3072
+temperature = 0.7
+
+[[env]]
+# Push the environment first: prime env push --path ./environments/ocr_corrector
+id = "rpant/ocr-corrector"
+
+# Hosted training containers cannot see this workspace's data/ folder, so the
+# environment must read a self-contained dataset with images and baselines
+# embedded. Build and push it with data_prep/package_dataset.py.
+args = { dataset_id = "rpant/ocr-corrector-ur", image_upscale = 4 }
+
+# Hosted Training docs: https://docs.primeintellect.ai/hosted-training

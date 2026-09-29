@@ -1,0 +1,72 @@
+# 50-step RL on Qwen3.5-35B-A3B. A METHOD TEST, not a deliverable.
+#
+#   export HF_TOKEN=$(cat ~/.cache/huggingface/token)
+#   prime train configs/lab/direct_rl50_35b.toml -e HF_TOKEN
+#
+# The project's goal is decent OCR from a SMALL open model, so a 35B policy is
+# not the product. This run exists to answer a question whose answer transfers
+# down to 4B:
+#
+#   Two RL runs on Qwen3.5-4B degraded. pass@16 said why -- best-of-16 was only
+#   0.015 below greedy, so GRPO had nothing to sharpen. That leaves an ambiguity:
+#   is RL wrong for THIS TASK, or was the 4B POLICY just not competent enough?
+#
+#   35B-A3B is competent (greedy 0.156, best-of-16 0.128, 93% of rollouts beat
+#   the 4B baseline). If GRPO improves it, "reach competence first, then RL" is
+#   a validated recipe and the SFT->RL notebook's arm B is worth running. If
+#   GRPO degrades it too, RL is the wrong tool for document OCR at any scale and
+#   the small-model path should be pure SFT.
+#
+# Caveat on interpretation: 35B's spread (greedy 0.156 vs best-of-16 0.128) is
+# 0.028 -- real, but not wide. A positive result is decisive; a null result is
+# suggestive rather than conclusive.
+#
+# Measured pass@16 on 10 held-out documents, direct OCR at 4x upscale:
+#   model            greedy   mean-16   best-16   spread   roll>4B-greedy
+#   Qwen3.5-4B        0.251     0.320     0.247    0.073        25.6%
+#   Qwen3.5-9B        0.259     0.394     0.206    0.188        37.5%
+#   Qwen3.5-35B-A3B   0.156     0.167     0.128    0.039        93.1%
+# (Qwen3.6-35B-A3B is listed for training but 404s on inference -- unusable.)
+name = "ocr-direct-rl50-35b"
+model = "Qwen/Qwen3.5-35B-A3B"
+
+max_steps = 50
+batch_size = 128
+rollouts_per_example = 8
+max_inflight_rollouts = 64   # payload/concurrency cap; 128 inflight caused a 47%
+                             # ModelError rate before the JPEG switch
+
+[sampling]
+# 35B emits ~300 tokens on this corpus; the longest ground truth is ~2.5k chars
+# (~1250 tokens). 1024 covers the realistic range and halves the worst-case
+# spend versus 1536, which matters more here than at 4B prices.
+max_tokens = 1024
+temperature = 0.7
+enable_thinking = false   # REQUIRED: the trainer's sampling block overrides the
+                          # environment's. Omitting this gave 100% truncation.
+
+[[env]]
+id = "rpant/ocr-direct"
+args = { dataset_id = "rpant/ocr-corrector-ur", image_upscale = 4 }
+
+[[post_batch_filters]]
+type = "repetition"
+enforce = true
+
+[[post_batch_filters]]
+type = "gibberish"
+enforce = true
+
+[eval]
+interval = 25
+num_examples = 32
+rollouts_per_example = 1
+
+[[eval.env]]
+id = "rpant/ocr-direct"
+args = { dataset_id = "rpant/ocr-corrector-ur", image_upscale = 4 }
+
+[val]
+interval = 10
+num_examples = 32
+rollouts_per_example = 1
