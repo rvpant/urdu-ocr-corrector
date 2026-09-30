@@ -150,8 +150,25 @@ code("""
 # new ImageDraw.py against a stale _typing.py and the next import dies with
 #   ImportError: cannot import name '_Ink' from 'PIL._typing'
 # Nothing here needs a newer pillow than the runtime provides.
+# Colab preinstalls torchao 0.10.0. Recent PEFT probes its TorchAO LoRA
+# dispatcher during adapter injection and *raises* on a too-old version instead
+# of falling back to ordinary LoRA:
+#   ImportError: Found an incompatible version of torchao. Found version 0.10.0,
+#   but only versions above 0.16.0 are supported
+# It surfaces deep in section 7, at attach_lora(). Nothing here uses torchao, so
+# remove it rather than upgrading -- torchao is pinned tightly to the torch build
+# and upgrading trades this mismatch for a harder one.
+%pip -q uninstall -y torchao
+
 %pip -q install -U "transformers>=4.57" "trl>=0.24" "peft>=0.17" "datasets>=3.0" \\
     "accelerate>=1.0" "bitsandbytes>=0.44" jiwer
+
+import importlib.util
+if importlib.util.find_spec("torchao") is not None:
+    print("!! torchao is still importable -- a dependency reinstalled it.")
+    print("   Runtime -> Restart session before continuing, or attach_lora() will raise.")
+else:
+    print("torchao absent (intended: PEFT then takes the plain LoRA path)")
 
 import PIL, importlib
 print("pillow", PIL.__version__, "(runtime default, deliberately not upgraded)")
@@ -561,20 +578,24 @@ md("""
 ## 5 · Model + LoRA
 
 ⚠️ **Verify this cell before the long run.** Class names and processor behaviour
-for a given VLM generation change between `transformers` releases. If
-`AutoModelForVision2Seq` fails, read the traceback — the fix is usually the
-model-specific class named in the error.
+for a given VLM generation change between `transformers` releases. If the
+auto-class fails, read the traceback — the fix is usually the model-specific
+class named in the error.
+
+`AutoModelForImageTextToText` replaced `AutoModelForVision2Seq`, which was
+**removed in transformers v5** (Jan 2026). The new name exists back to 4.46, so
+it is the safer spelling on either side of that boundary.
 """)
 
 code('''
-from transformers import AutoProcessor, AutoModelForVision2Seq, BitsAndBytesConfig
+from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, PeftModel
 
 DTYPE = getattr(torch, CFG["dtype"])
 
 def load_base(adapter_path=None, for_training=True):
     proc = AutoProcessor.from_pretrained(CFG["base_model"], trust_remote_code=True)
-    model = AutoModelForVision2Seq.from_pretrained(
+    model = AutoModelForImageTextToText.from_pretrained(
         CFG["base_model"], torch_dtype=DTYPE, device_map="auto",
         attn_implementation=CFG["attn_impl"], trust_remote_code=True)
     if adapter_path:
