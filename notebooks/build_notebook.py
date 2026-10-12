@@ -439,9 +439,17 @@ def normalize(s):
 
 _FENCE = re.compile(r"^\\s*```[a-zA-Z]*\\s*\\n(.*?)\\n?\\s*```\\s*$", re.DOTALL)
 _PREAMBLE = re.compile(r"^\\s*(here (is|are)[^:\\n]*:|the transcription[^:\\n]*:|transcription:)\\s*", re.I)
+# Reasoning blocks, closed or not. `render_chat` disables thinking at the
+# template level, so this should never fire -- but if a template ignores the
+# flag, reasoning text would otherwise be scored as inserted characters and
+# show up as a reading failure instead of a configuration one. The unterminated
+# alternative matters because a block truncated by max_new_tokens has no
+# closing tag.
+_THINK = re.compile(r"<think>.*?</think>|<think>.*\\Z", re.DOTALL | re.I)
 
 def clean_output(text):
     if not text: return ""
+    text = _THINK.sub("", text)
     m = _FENCE.match(text)
     if m: text = m.group(1)
     return _PREAMBLE.sub("", text).strip()
@@ -653,8 +661,60 @@ def build_messages(image, target=None):
         msgs.append({"role":"assistant","content":[{"type":"text","text":target}]})
     return msgs
 
+def render_chat(processor, messages, add_generation_prompt=False):
+    """Apply the chat template with thinking mode OFF, always.
+
+    Qwen3.5 enables thinking by default. Left on for this task it does not
+    reason usefully -- it re-litigates ambiguous glyphs until it runs out of
+    budget. The hosted runs showed 40,014 output tokens per rollout and one
+    completion of 148,648 characters re-asserting a single word; here it put
+    the baseline at CER 1.129 and length ratio 2.650 against an expected 0.168.
+    Every measurement that produced 0.168 passed enable_thinking=False.
+
+    Routed through one function because the collator renders the prompt twice --
+    once with the target to build the training text, once without to find the
+    mask boundary. If those two renderings disagree about thinking scaffolding,
+    the prompt-length mask is wrong and SFT trains on a shifted target. One
+    function, one behaviour.
+    """
+    kw = dict(tokenize=False, add_generation_prompt=add_generation_prompt)
+    try:
+        return processor.apply_chat_template(messages, enable_thinking=False, **kw)
+    except TypeError:
+        # Older processors do not forward unknown kwargs to the template.
+        return processor.apply_chat_template(
+            messages, chat_template_kwargs={"enable_thinking": False}, **kw)
+
 model, processor = load_base()
 print(type(model).__name__, "|", type(processor).__name__)
+''')
+
+md("""
+### 5a · Confirm thinking mode is off
+
+Qwen3.5 reasons by default, and on this task it does not reason usefully — it
+re-litigates ambiguous glyphs until the token budget runs out. Left on, the
+hosted runs emitted 40,014 tokens per rollout; here it put the baseline at CER
+1.129 with length ratio 2.650 against an expected 0.168.
+
+This checks the rendered template directly rather than inferring it from a bad
+CER an hour later.
+""")
+
+code('''
+_probe = render_chat(processor, build_messages(SFT_EXAMPLES[0]["image"]),
+                     add_generation_prompt=True)
+_tail = _probe[-220:].replace("\\n", "\\\\n")
+print("rendered prompt tail:", _tail)
+
+# An *empty* <think></think> pair is how Qwen3 signals thinking-off in some
+# template versions, so its presence is fine. An unclosed <think> is not.
+_open = _probe.count("<think>") - _probe.count("</think>")
+assert _open == 0, (
+    f"template left {_open} unclosed <think> -- thinking is ON. The model will "
+    "reason instead of transcribing. Check that render_chat's enable_thinking "
+    "kwarg reached this processor's template.")
+print("\\nthinking: OFF (no dangling <think>)  -- generation is probed in 6a")
 ''')
 
 # ---------------------------------------------------------------- generation + eval
@@ -671,8 +731,8 @@ code('''
 @torch.no_grad()
 def generate_batch(model, processor, images, max_new=None, temperature=0.0, num_return=1):
     max_new = max_new or CFG["gen_max_new"]
-    texts = [processor.apply_chat_template(build_messages(im), tokenize=False,
-                                           add_generation_prompt=True) for im in images]
+    texts = [render_chat(processor, build_messages(im), add_generation_prompt=True)
+             for im in images]
     inputs = processor(text=texts, images=[[im] for im in images],
                        return_tensors="pt", padding=True).to(model.device)
     kw = dict(max_new_tokens=max_new, num_return_sequences=num_return,
@@ -708,6 +768,34 @@ def evaluate(model, processor, split="test", n=None, tag="eval", batch=4, save=T
     return s, rows
 ''')
 
+md("""
+### 6a · One-document probe before the 100-document baseline
+
+The full baseline is ~100 greedy generations. A misconfiguration costs that
+whole run, so spend one generation first. **`ratio` is the diagnostic** — the
+difference between "reads badly" and "is misconfigured" shows up there long
+before it shows up in CER. Reading skill barely moves output length; thinking
+mode, a missing stop condition, or a wrong prompt all push ratio past 2.
+""")
+
+code('''
+_gen = generate_batch(model, processor, [SFT_EXAMPLES[0]["image"]], temperature=0.0)[0]
+_b = cer_breakdown(SFT_EXAMPLES[0]["target"], _gen)
+print(f"cer={_b['cer']:.3f} sub={_b['sub']:.3f} ins={_b['ins']:.3f} ratio={_b['ratio']:.3f}")
+print(f"\\nfirst 300 chars of output:\\n{_gen[:300]}")
+print(f"\\nfirst 300 chars of ground truth:\\n{SFT_EXAMPLES[0]['target'][:300]}")
+
+if _b["ratio"] > 2.0:
+    print("\\n!! ratio > 2: the model is writing far more than the page contains.")
+    print("   Thinking mode is the usual cause -- re-run 5a. Do NOT run 6b yet;")
+    print("   it would spend 100 generations confirming a config bug.")
+elif _b["ins"] > 0.5:
+    print("\\n!! insertions high at near-normal length: suspect the instruction")
+    print("   text or clean_output, not the model's reading.")
+else:
+    print("\\nlooks sane -- proceed to 6b")
+''')
+
 md("### 6b · Pre-training baseline on the test set\n\nThe reference every later number is measured against.")
 
 code('''
@@ -740,8 +828,8 @@ class VLMOcrDataset(TorchDataset):
 def make_collator(processor):
     tok = processor.tokenizer
     def collate(batch):
-        texts  = [processor.apply_chat_template(build_messages(b["image"], b["target"]),
-                                                tokenize=False) for b in batch]
+        texts  = [render_chat(processor, build_messages(b["image"], b["target"]))
+                  for b in batch]
         images = [[b["image"]] for b in batch]
         enc = processor(text=texts, images=images, return_tensors="pt", padding=True,
                         truncation=True, max_length=CFG["sft_max_seq_len"])
@@ -749,8 +837,8 @@ def make_collator(processor):
         labels[labels == (tok.pad_token_id or tok.eos_token_id)] = -100
         # mask everything before the assistant turn so loss covers only the target
         for k, b in enumerate(batch):
-            prompt = processor.apply_chat_template(build_messages(b["image"]), tokenize=False,
-                                                   add_generation_prompt=True)
+            prompt = render_chat(processor, build_messages(b["image"]),
+                                 add_generation_prompt=True)
             plen = len(tok(prompt, add_special_tokens=False)["input_ids"])
             labels[k, :plen] = -100
         for key in ("image_token_id", "video_token_id"):
