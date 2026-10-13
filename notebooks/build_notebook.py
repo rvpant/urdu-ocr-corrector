@@ -685,7 +685,33 @@ def render_chat(processor, messages, add_generation_prompt=False):
         return processor.apply_chat_template(
             messages, chat_template_kwargs={"enable_thinking": False}, **kw)
 
+from contextlib import contextmanager
+
+@contextmanager
+def padding_side(processor, side):
+    """Temporarily set the tokenizer's padding side.
+
+    Decoder-only generation requires LEFT padding. With right padding a short
+    prompt becomes [tokens..., pad, pad, pad] and generation continues from the
+    position *after* the pads rather than after the prompt's real last token --
+    so the shortest items in a batch produce the worst output, and the damage
+    scales with how uneven the batch is. Training wants the opposite: RIGHT
+    padding, so labels line up with inputs.
+
+    The Prime measurement of 0.168 sent one image per request and therefore
+    never padded anything, which is why this never showed up there.
+    """
+    tok = processor.tokenizer
+    prev = tok.padding_side
+    tok.padding_side = side
+    try:
+        yield
+    finally:
+        tok.padding_side = prev
+
 model, processor = load_base()
+print("tokenizer default padding_side:", processor.tokenizer.padding_side,
+      "(generation forces left, training forces right)")
 print(type(model).__name__, "|", type(processor).__name__)
 ''')
 
@@ -733,8 +759,11 @@ def generate_batch(model, processor, images, max_new=None, temperature=0.0, num_
     max_new = max_new or CFG["gen_max_new"]
     texts = [render_chat(processor, build_messages(im), add_generation_prompt=True)
              for im in images]
-    inputs = processor(text=texts, images=[[im] for im in images],
-                       return_tensors="pt", padding=True).to(model.device)
+    # LEFT padding -- see padding_side(). Right padding silently corrupts every
+    # item in the batch that is shorter than the longest one.
+    with padding_side(processor, "left"):
+        inputs = processor(text=texts, images=[[im] for im in images],
+                           return_tensors="pt", padding=True).to(model.device)
     kw = dict(max_new_tokens=max_new, num_return_sequences=num_return,
               pad_token_id=processor.tokenizer.pad_token_id or processor.tokenizer.eos_token_id)
     if temperature and temperature > 0:
@@ -793,7 +822,54 @@ elif _b["ins"] > 0.5:
     print("\\n!! insertions high at near-normal length: suspect the instruction")
     print("   text or clean_output, not the model's reading.")
 else:
-    print("\\nlooks sane -- proceed to 6b")
+    print("\\nlooks sane -- proceed to the batch-invariance check")
+''')
+
+md("""
+### 6a-ii · Batch invariance
+
+The decisive test for a padding bug. One document decoded **alone** and the same
+document decoded **inside a batch of four** must produce identical text —
+greedy decoding is deterministic, and batching is supposed to be a performance
+detail, not a semantic one.
+
+If they differ, padding is corrupting the batch. The failure is asymmetric and
+easy to miss: only items *shorter* than the longest in their batch are damaged,
+so a one-document spot check looks perfect while the 100-document eval is wrong.
+That is the shape of the discrepancy against Prime, where every request carried
+a single image and nothing was ever padded.
+""")
+
+code('''
+# Pick documents with very different ground-truth lengths: padding damage grows
+# with the spread inside the batch, so a uniform batch can hide it.
+_by_len = sorted(range(min(40, len(SFT_EXAMPLES))),
+                 key=lambda i: len(SFT_EXAMPLES[i]["target"]))
+_probe_i = _by_len[0]                      # shortest -> most padding, most damage
+_others  = [_by_len[-1], _by_len[len(_by_len)//2], _by_len[-2]]
+
+_alone = generate_batch(model, processor, [SFT_EXAMPLES[_probe_i]["image"]],
+                        temperature=0.0)[0]
+_batch = generate_batch(model, processor,
+                        [SFT_EXAMPLES[i]["image"] for i in [_probe_i] + _others],
+                        temperature=0.0)[0]
+
+print(f"probe doc {SFT_EXAMPLES[_probe_i]['doc_id']} "
+      f"(gt {len(SFT_EXAMPLES[_probe_i]['target'])} chars, shortest of {len(_by_len)})")
+print(f"batch-mate gt lengths: {[len(SFT_EXAMPLES[i]['target']) for i in _others]}")
+print(f"\\nalone : {_alone[:120]!r}")
+print(f"batched: {_batch[:120]!r}")
+
+if _alone == _batch:
+    print("\\nIDENTICAL -- padding is correct, batched eval is trustworthy")
+else:
+    _ca = cer_breakdown(SFT_EXAMPLES[_probe_i]["target"], _alone)
+    _cb = cer_breakdown(SFT_EXAMPLES[_probe_i]["target"], _batch)
+    print(f"\\n!! DIFFER -- batching changes the output.")
+    print(f"   alone  : cer={_ca['cer']:.3f} ratio={_ca['ratio']:.3f}")
+    print(f"   batched: cer={_cb['cer']:.3f} ratio={_cb['ratio']:.3f}")
+    print("   Every batched number is suspect. Set evaluate(..., batch=1) to")
+    print("   sidestep it, and check padding_side reached this processor.")
 ''')
 
 md("### 6b · Pre-training baseline on the test set\n\nThe reference every later number is measured against.")
@@ -831,8 +907,12 @@ def make_collator(processor):
         texts  = [render_chat(processor, build_messages(b["image"], b["target"]))
                   for b in batch]
         images = [[b["image"]] for b in batch]
-        enc = processor(text=texts, images=images, return_tensors="pt", padding=True,
-                        truncation=True, max_length=CFG["sft_max_seq_len"])
+        # RIGHT padding for training: labels are built by cloning input_ids, so
+        # the two must align position-for-position. Pinned explicitly rather than
+        # inherited, because generation flips this to "left".
+        with padding_side(processor, "right"):
+            enc = processor(text=texts, images=images, return_tensors="pt", padding=True,
+                            truncation=True, max_length=CFG["sft_max_seq_len"])
         labels = enc["input_ids"].clone()
         labels[labels == (tok.pad_token_id or tok.eos_token_id)] = -100
         # mask everything before the assistant turn so loss covers only the target
