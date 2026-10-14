@@ -322,7 +322,7 @@ CFG = dict(
     # ("sft_train","rl_train") for 729 training documents instead of 479 -- a 52%
     # increase -- and skip sections 9-12. One-way door for this run only, since
     # the split assignment lives in the dataset and is reproducible.
-    train_splits   = ("sft_train",),
+    train_splits   = ("sft_train"),
 
     # --- augmentation (OFF by default; ARM A / sft_train ONLY) ---
     USE_AUGMENTATION   = False,
@@ -385,7 +385,7 @@ CFG = dict(
 
     # --- output ---
     run_dir            = "/content/drive/MyDrive/ocr_sft_rl",
-    seed               = 1234,
+    seed               = 1234
 )
 
 INSTRUCTION = ("Transcribe all text in this document image. "
@@ -918,7 +918,13 @@ nothing, which is exactly the case worth catching early.
 code('''
 from torch.utils.data import Dataset as TorchDataset
 from transformers import TrainerCallback
-from trl import SFTConfig, SFTTrainer
+# Plain Trainer, not TRL's SFTTrainer. Every SFT-specific behaviour was already
+# disabled here -- a custom collator plus skip_prepare_dataset -- so SFTTrainer
+# contributed nothing but its dataset validation, which in TRL v1.x rejects
+# torch Dataset subclasses outright ("must be a `Dataset` or `IterableDataset`").
+# Our examples hold PIL images and are assembled by `collate`, so a torch
+# Dataset is the right container.
+from transformers import Trainer, TrainingArguments
 
 class VLMOcrDataset(TorchDataset):
     def __init__(self, examples): self.ex = examples
@@ -987,7 +993,7 @@ _est_total_steps = max(1, (len(SFT_EXAMPLES) * CFG["sft_epochs"])
                           // (CFG["sft_batch"] * CFG["sft_grad_accum"]))
 print(f"estimated optimizer steps: {_est_total_steps}")
 
-sft_args = SFTConfig(
+sft_args = TrainingArguments(
     output_dir=str(RUN/"armA_sft"),
     num_train_epochs=CFG["sft_epochs"],
     per_device_train_batch_size=CFG["sft_batch"],
@@ -1002,12 +1008,11 @@ sft_args = SFTConfig(
     save_strategy="steps", save_steps=50, save_total_limit=2,
     bf16=True, gradient_checkpointing=True,
     remove_unused_columns=False,
-    dataset_kwargs={"skip_prepare_dataset": True},
     report_to=[],
-    seed=CFG["seed"],
+    seed=CFG["seed"]
 )
 
-trainer = SFTTrainer(model=model, args=sft_args,
+trainer = Trainer(model=model, args=sft_args,
                      train_dataset=VLMOcrDataset(SFT_EXAMPLES),
                      data_collator=collate, callbacks=[logger])
 ''')
@@ -1020,13 +1025,12 @@ under a minute instead of thirty minutes into the real run.
 """)
 
 code('''
-_smoke = SFTTrainer(
+_smoke = Trainer(
     model=model,
-    args=SFTConfig(output_dir=str(RUN/"_smoke"), max_steps=2,
+    args=TrainingArguments(output_dir=str(RUN/"_smoke"), max_steps=2,
                    per_device_train_batch_size=1, gradient_accumulation_steps=1,
                    logging_steps=1, bf16=True, gradient_checkpointing=True,
-                   remove_unused_columns=False,
-                   dataset_kwargs={"skip_prepare_dataset": True}, report_to=[]),
+                   remove_unused_columns=False, report_to=[]),
     train_dataset=VLMOcrDataset(SFT_EXAMPLES[:4]), data_collator=collate)
 _smoke.train()
 print("\\nsmoke OK -- loss is finite and backward() ran. Proceed.")
@@ -1271,7 +1275,7 @@ _grpo_kwargs = dict(
     temperature=CFG["grpo_temperature"],
     max_completion_length=CFG["grpo_max_new"],
     logging_steps=1, save_steps=20, save_total_limit=2,
-    bf16=True, gradient_checkpointing=True, report_to=[], seed=CFG["seed"],
+    bf16=True, gradient_checkpointing=True, report_to=[], seed=CFG["seed"]
 )
 
 # Disable group-std advantage scaling. TRL >= 0.22 spells this scale_rewards="none";
@@ -1386,14 +1390,14 @@ C_EXAMPLES = build_examples("rl_train", augment=False)
 loggerC = MetricLogger(RUN/"metrics/armC_train_log.jsonl", 0, lambda s: None)
 assert len(C_EXAMPLES) == len(SPLITS["rl_train"]), (
     "arm C must see exactly the documents arm B saw, once each")
-argsC = SFTConfig(output_dir=str(RUN/"armC_sft"), num_train_epochs=CFG["c_epochs"],
+argsC = TrainingArguments(output_dir=str(RUN/"armC_sft"), num_train_epochs=CFG["c_epochs"],
                   per_device_train_batch_size=CFG["sft_batch"],
                   gradient_accumulation_steps=CFG["sft_grad_accum"],
                   learning_rate=CFG["c_lr"], lr_scheduler_type="cosine",
                   logging_steps=1, bf16=True, gradient_checkpointing=True,
-                  remove_unused_columns=False, dataset_kwargs={"skip_prepare_dataset": True},
+                  remove_unused_columns=False,
                   report_to=[], seed=CFG["seed"])
-trainerC = SFTTrainer(model=modelC, args=argsC, train_dataset=VLMOcrDataset(C_EXAMPLES),
+trainerC = Trainer(model=modelC, args=argsC, train_dataset=VLMOcrDataset(C_EXAMPLES),
                       data_collator=collateC, callbacks=[loggerC])
 trainerC.train()
 modelC.save_pretrained(RUN/"adapters/armC")
