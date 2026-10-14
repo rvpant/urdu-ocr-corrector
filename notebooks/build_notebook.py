@@ -359,11 +359,15 @@ CFG = dict(
     sft_batch          = 1,
     sft_grad_accum     = 8,
     sft_warmup_ratio   = 0.03,
-    # Must exceed image tokens + target tokens, or truncation cuts the image
-    # token block and the processor raises a count mismatch. At 2x upscale a
-    # 496x460 page costs ~2,496 image tokens; the longest ground truth is 2,465
-    # chars at roughly one token per char for Urdu; plus ~50 for the instruction
-    # and template. Worst case ~5,000, so this never truncates in practice.
+    # A cap, not an allocation: the collator pads to the longest item in the
+    # batch (padding=True), and batch size is 1, so tensors are sized by actual
+    # content and a generous cap costs no memory. Truncation that lands inside
+    # the image-token block *raises* rather than degrading, so the cap must clear
+    # the longest real sequence with margin.
+    # Measured over all 829 documents (Qwen tokenizer, 0.652 tokens/char for
+    # Urdu, ~2,496 image tokens at 2x upscale, ~50 for instruction+template):
+    #   total sequence  median 2,833   p90 3,272   p99 3,756   max 4,109
+    #   cap 3072 -> 222 docs truncated; cap 4096 -> 1; cap 5120+ -> 0
     sft_max_seq_len    = 8192,
     sft_eval_every     = 25,     # steps; evaluates on EVAL_SUBSET of test
     sft_eval_subset    = 32,     # keep small -- generation is the slow part
@@ -954,10 +958,11 @@ def make_collator(processor):
         # blames truncation without saying what to set.
         if enc["input_ids"].shape[1] >= CFG["sft_max_seq_len"]:
             raise ValueError(
-                f"sequence hit sft_max_seq_len ({CFG['sft_max_seq_len']}). The image "
-                f"costs ~2.5k tokens at upscale {CFG['image_upscale']} and the longest "
-                "target ~2.5k; raise CFG['sft_max_seq_len'] (it is read per call, so "
-                "no need to redefine the collator) or lower CFG['image_upscale'].")
+                f"sequence hit sft_max_seq_len ({CFG['sft_max_seq_len']}). Measured "
+                f"max over this corpus is ~4,109 tokens at upscale 2 (image ~2,496 + "
+                f"target up to ~1,563); you are at upscale {CFG['image_upscale']}. "
+                "Raise CFG['sft_max_seq_len'] -- it is read per call, so no need to "
+                "redefine the collator -- or lower CFG['image_upscale'].")
         labels = enc["input_ids"].clone()
         labels[labels == (tok.pad_token_id or tok.eos_token_id)] = -100
         # mask everything before the assistant turn so loss covers only the target
