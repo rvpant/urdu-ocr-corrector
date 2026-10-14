@@ -612,6 +612,14 @@ def load_base(adapter_path=None, for_training=True):
     return model, proc
 
 VISION_PREFIXES = ("visual", "vision_tower", "vision_model", "image_encoder")
+# PEFT's own injected submodules. Once LoRA is attached, named_modules() reports
+# `...qkv.base_layer`, `...qkv.lora_A.default` etc, and those are real nn.Linear
+# instances -- so enumerating a wrapped model yields LoRA internals as targets
+# and PEFT then fails to resolve them. Skipped defensively; attach_lora also
+# refuses to run twice.
+PEFT_INTERNALS = ("base_layer", "lora_A", "lora_B", "lora_embedding_A",
+                  "lora_embedding_B", "lora_magnitude_vector", "modules_to_save",
+                  "original_module")
 
 def resolve_lora_targets(model, include_vision=None):
     """Enumerate real nn.Linear module paths instead of guessing leaf names.
@@ -633,7 +641,10 @@ def resolve_lora_targets(model, include_vision=None):
     for name, mod in model.named_modules():
         if not isinstance(mod, torch.nn.Linear):
             continue
-        is_vision = any(p in name.split(".") for p in VISION_PREFIXES)
+        parts = name.split(".")
+        if any(p in PEFT_INTERNALS for p in parts):
+            continue
+        is_vision = any(p in parts for p in VISION_PREFIXES)
         if is_vision:
             vis.append(name)                       # every Linear in the tower
         elif name.rsplit(".", 1)[-1] in leaves:
@@ -647,7 +658,20 @@ def resolve_lora_targets(model, include_vision=None):
         print(f"  vision example:   {vis[0]}")
     return lang + (vis if include_vision else [])
 
+def is_peft(m):
+    """Whether LoRA is already attached, without importing a specific class."""
+    return hasattr(m, "peft_config") or type(m).__name__.startswith("Peft")
+
 def attach_lora(model, include_vision=None):
+    # Re-running this cell after a later cell failed is the normal way to hit
+    # this: the model from the first attempt is still wrapped, and wrapping it
+    # again targets LoRA's own internals. Fail with the fix rather than letting
+    # PEFT raise NoMatchingPeftModuleError about `qkv.base_layer`.
+    if is_peft(model):
+        raise RuntimeError(
+            "LoRA is already attached to this model. Re-run the model-load cell "
+            "in section 5 (`model, processor = load_base()`) to get a clean base "
+            "model, then run this cell again.")
     targets = resolve_lora_targets(model, include_vision)
     cfg = LoraConfig(r=CFG["lora_r"], lora_alpha=CFG["lora_alpha"],
                      lora_dropout=CFG["lora_dropout"], bias="none",
