@@ -364,10 +364,17 @@ CFG = dict(
     # content and a generous cap costs no memory. Truncation that lands inside
     # the image-token block *raises* rather than degrading, so the cap must clear
     # the longest real sequence with margin.
-    # Measured over all 829 documents (Qwen tokenizer, 0.652 tokens/char for
-    # Urdu, ~2,496 image tokens at 2x upscale, ~50 for instruction+template):
-    #   total sequence  median 2,833   p90 3,272   p99 3,756   max 4,109
-    #   cap 3072 -> 222 docs truncated; cap 4096 -> 1; cap 5120+ -> 0
+    # Measured over all 829 documents: Urdu tokenizes at 0.652 tokens/char, so
+    # targets run median 287, p90 726, max 1,563 tokens; plus ~50 for the
+    # instruction and chat template. With max_image_tokens below, worst case is
+    # ~4,096 + 1,563 + 50 = 5,709.
+    # Section 7's preflight measures this over every example instead of trusting
+    # the arithmetic -- an earlier version of this comment held image tokens
+    # constant at 2,496 and was 5x low on the tail.
+    # Per-page image token budget, enforced as a pixel cap (see
+    # cap_image_pixels). Without it, token count follows the source scan's area
+    # and reaches 12,060 on the largest page at upscale 2.
+    max_image_tokens   = 4096,
     sft_max_seq_len    = 8192,
     sft_eval_every     = 25,     # steps; evaluates on EVAL_SUBSET of test
     sft_eval_subset    = 32,     # keep small -- generation is the slow part
@@ -610,8 +617,36 @@ from peft import LoraConfig, get_peft_model, PeftModel
 
 DTYPE = getattr(torch, CFG["dtype"])
 
+def cap_image_pixels(proc, budget_tokens=None):
+    """Bound image tokens per page by capping total pixels.
+
+    Qwen3.5's processor ships no pixel cap, and `image_upscale` is a blind
+    multiplier, so token count tracks the source scan's area -- which varies 16x
+    across this corpus (484x352 to 1468x2148). Measured at upscale 2:
+
+        image tokens   median 1,550   p90 4,320   max 12,060
+
+    A 12k-token page is ~30x the attention compute of the median one and
+    overruns any sane sequence budget. patch_size 16 with merge_size 2 means one
+    token per 32x32 pixel block, so a token budget converts directly to a pixel
+    cap. Only the largest ~7% of pages are touched, and those have the most
+    redundant detail; the median page is unaffected.
+
+    Applied to the single shared processor, so training and evaluation see the
+    same preprocessing -- a cap on one side only would confound the very
+    before/after comparison this notebook exists to make.
+    """
+    budget = budget_tokens or CFG["max_image_tokens"]
+    px = budget * 32 * 32
+    try:
+        proc.image_processor.size = {"longest_edge": px, "shortest_edge": 65536}
+    except Exception as e:
+        print(f"  !! could not set pixel cap ({e}); sequences may overrun")
+    return proc
+
 def load_base(adapter_path=None, for_training=True):
     proc = AutoProcessor.from_pretrained(CFG["base_model"], trust_remote_code=True)
+    cap_image_pixels(proc)
     model = AutoModelForImageTextToText.from_pretrained(
         CFG["base_model"], torch_dtype=DTYPE, device_map="auto",
         attn_implementation=CFG["attn_impl"], trust_remote_code=True)
@@ -1038,11 +1073,46 @@ trainer = Trainer(model=model, args=sft_args,
 ''')
 
 md("""
-### 7a · Smoke test first
+### 7a · Preflight on every example, then a smoke test
 
-Two optimizer steps on four examples. Shape and masking bugs surface here in
-under a minute instead of thirty minutes into the real run.
+The smoke test runs two steps on four examples, which catches shape and masking
+bugs. It does **not** catch anything that varies across the corpus — a four
+document sample passed cleanly while a page five times larger was waiting in the
+training set.
+
+So measure the sequence length of every example first. It costs one processor
+call per document and no GPU, and it either proves the budget holds or names the
+document that breaks it.
 """)
+
+code('''
+_tok = processor.tokenizer
+_lens = []
+for n, ex in enumerate(SFT_EXAMPLES):
+    text = render_chat(processor, build_messages(ex["image"], ex["target"]))
+    with padding_side(processor, "right"):
+        ids = processor(text=[text], images=[[ex["image"]]], return_tensors="pt")["input_ids"]
+    _lens.append((ids.shape[1], ex["doc_id"]))
+    if n % 50 == 0: print(f"  {n}/{len(SFT_EXAMPLES)}", end="\\r")
+
+_lens.sort()
+_tot = [L for L, _ in _lens]
+print(f"sequence length over {len(_tot)} training examples:")
+print(f"  median {_tot[len(_tot)//2]}  p90 {_tot[int(.9*len(_tot))]}  "
+      f"max {_tot[-1]} (doc {_lens[-1][1]})")
+_cap = CFG["sft_max_seq_len"]
+_over = [(L, d) for L, d in _lens if L > _cap]
+if _over:
+    raise ValueError(
+        f"{len(_over)} example(s) exceed sft_max_seq_len={_cap}, longest "
+        f"{_over[-1][0]} tokens (doc {_over[-1][1]}). Truncation inside the "
+        "image-token block raises rather than degrades, so this would fail "
+        "mid-run. Lower CFG['max_image_tokens'] (currently "
+        f"{CFG['max_image_tokens']}) or raise sft_max_seq_len.")
+print(f"  all within sft_max_seq_len={_cap}  (headroom {_cap - _tot[-1]} tokens)")
+''')
+
+md("Now the two-step smoke test.")
 
 code('''
 _smoke = Trainer(
