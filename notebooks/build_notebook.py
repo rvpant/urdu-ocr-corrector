@@ -959,13 +959,20 @@ def periodic_eval(step):
 
 logger = MetricLogger(RUN/"metrics/sft_train_log.jsonl", CFG["sft_eval_every"], periodic_eval)
 
+_est_total_steps = max(1, (len(SFT_EXAMPLES) * CFG["sft_epochs"])
+                          // (CFG["sft_batch"] * CFG["sft_grad_accum"]))
+print(f"estimated optimizer steps: {_est_total_steps}")
+
 sft_args = SFTConfig(
     output_dir=str(RUN/"armA_sft"),
     num_train_epochs=CFG["sft_epochs"],
     per_device_train_batch_size=CFG["sft_batch"],
     gradient_accumulation_steps=CFG["sft_grad_accum"],
     learning_rate=CFG["sft_lr"],
-    warmup_ratio=CFG["sft_warmup_ratio"],
+    # warmup_ratio was removed from TrainingArguments in transformers 5.15.
+    # An explicit step count avoids depending on whether this version reads a
+    # float as a ratio; at ~180 total steps, 3% is 5.
+    warmup_steps=max(1, int(CFG["sft_warmup_ratio"] * _est_total_steps)),
     lr_scheduler_type="cosine",
     logging_steps=1,
     save_strategy="steps", save_steps=50, save_total_limit=2,
