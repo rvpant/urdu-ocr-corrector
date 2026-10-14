@@ -359,7 +359,12 @@ CFG = dict(
     sft_batch          = 1,
     sft_grad_accum     = 8,
     sft_warmup_ratio   = 0.03,
-    sft_max_seq_len    = 2048,
+    # Must exceed image tokens + target tokens, or truncation cuts the image
+    # token block and the processor raises a count mismatch. At 2x upscale a
+    # 496x460 page costs ~2,496 image tokens; the longest ground truth is 2,465
+    # chars at roughly one token per char for Urdu; plus ~50 for the instruction
+    # and template. Worst case ~5,000, so this never truncates in practice.
+    sft_max_seq_len    = 8192,
     sft_eval_every     = 25,     # steps; evaluates on EVAL_SUBSET of test
     sft_eval_subset    = 32,     # keep small -- generation is the slow part
 
@@ -943,6 +948,16 @@ def make_collator(processor):
         with padding_side(processor, "right"):
             enc = processor(text=texts, images=images, return_tensors="pt", padding=True,
                             truncation=True, max_length=CFG["sft_max_seq_len"])
+        # Truncation that lands inside the image-token block is unrecoverable --
+        # the processor raises a count mismatch rather than training on a damaged
+        # sequence. Surface the real cause, since the processor's own message
+        # blames truncation without saying what to set.
+        if enc["input_ids"].shape[1] >= CFG["sft_max_seq_len"]:
+            raise ValueError(
+                f"sequence hit sft_max_seq_len ({CFG['sft_max_seq_len']}). The image "
+                f"costs ~2.5k tokens at upscale {CFG['image_upscale']} and the longest "
+                "target ~2.5k; raise CFG['sft_max_seq_len'] (it is read per call, so "
+                "no need to redefine the collator) or lower CFG['image_upscale'].")
         labels = enc["input_ids"].clone()
         labels[labels == (tok.pad_token_id or tok.eos_token_id)] = -100
         # mask everything before the assistant turn so loss covers only the target
