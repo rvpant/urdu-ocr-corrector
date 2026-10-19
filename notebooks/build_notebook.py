@@ -1349,10 +1349,22 @@ def ocr_reward(completions, doc_id=None, **kw):
         rl_reward_log.append(dict(doc_id=doc_id[i] if doc_id else None, reward=r, **b))
     return out
 
+# `image` must be a LIST per sample, even for one image. TRL's pixel-value
+# slicing (split_pixel_values_by_grid / _get_per_token_logps_and_entropies)
+# assumes a per-sample list and mis-slices a bare PIL image, surfacing as
+# "shape mismatch: value tensor of shape [3, N] cannot be broadcast to
+# indexing result of shape [3, M]".
 rl_ds = SPLITS["rl_train"].map(lambda ex: {
     "prompt": [{"role":"user","content":[{"type":"image"},{"type":"text","text":INSTRUCTION}]}],
-    "image": encode_image(ex["image"]), "doc_id": ex["doc_id"]},
+    "image": [encode_image(ex["image"])], "doc_id": ex["doc_id"]},
     remove_columns=[c for c in SPLITS["rl_train"].column_names if c != "doc_id"])
+
+# Pin left padding for the rest of the run. padding_side() restores on exit, so
+# without this the trainer's scoring pass re-processes prompts with the
+# processor's default (right) while training uses left -- for Qwen-VL's M-RoPE
+# that marks the image span at the wrong indices. See TRL issue ingambe/trl#126.
+processor.tokenizer.padding_side = "left"
+print("processor.tokenizer.padding_side =", processor.tokenizer.padding_side)
 
 _grpo_kwargs = dict(
     output_dir=str(RUN/"armB_grpo"),
