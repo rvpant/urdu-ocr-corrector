@@ -400,7 +400,14 @@ CFG = dict(
     passk_docs         = 20,
 
     # --- output ---
+    # Drive holds what must survive the session: metrics, figures, and the final
+    # adapters (~110 MB each at bf16).
     run_dir            = "/content/drive/MyDrive/ocr_sft_rl",
+    # Trainer checkpoints go to LOCAL disk instead. They carry optimizer state --
+    # roughly 3x the adapter size each -- and exist only for crash recovery
+    # inside a session, so writing them to Drive burns ~700 MB of quota for
+    # files nothing ever reads. Running out mid-run means nothing lands at all.
+    ckpt_dir           = "/content/ocr_ckpt",
     seed               = 1234
 )
 
@@ -418,7 +425,20 @@ except Exception as e:
 RUN = Path(CFG["run_dir"]); (RUN/"metrics").mkdir(parents=True, exist_ok=True)
 (RUN/"adapters").mkdir(exist_ok=True); (RUN/"figures").mkdir(exist_ok=True)
 (RUN/"config.json").write_text(json.dumps(CFG, indent=2))
-print("run dir:", RUN)
+CKPT = Path(CFG["ckpt_dir"]); CKPT.mkdir(parents=True, exist_ok=True)
+print("run dir (persistent):", RUN)
+print("ckpt dir (ephemeral):", CKPT)
+
+# Free space matters more than it looks: Drive filling up mid-run means the
+# final adapter and the metrics both fail to write, so the whole session is
+# lost rather than degraded. Check before spending an hour on an A100.
+import shutil
+for label, p in (("run_dir", RUN), ("ckpt_dir", CKPT)):
+    free_gb = shutil.disk_usage(p).free / 2**30
+    print(f"  {label}: {free_gb:.1f} GB free")
+    if label == "run_dir" and free_gb < 1.0:
+        print("   !! under 1 GB. Each adapter is ~110 MB and metrics add up; "
+              "free space on Drive before training.")
 ''')
 
 # ---------------------------------------------------------------- metrics lib
@@ -1049,7 +1069,7 @@ _est_total_steps = max(1, (len(SFT_EXAMPLES) * CFG["sft_epochs"])
 print(f"estimated optimizer steps: {_est_total_steps}")
 
 sft_args = TrainingArguments(
-    output_dir=str(RUN/"armA_sft"),
+    output_dir=str(CKPT/"armA_sft"),
     num_train_epochs=CFG["sft_epochs"],
     per_device_train_batch_size=CFG["sft_batch"],
     gradient_accumulation_steps=CFG["sft_grad_accum"],
@@ -1117,7 +1137,7 @@ md("Now the two-step smoke test.")
 code('''
 _smoke = Trainer(
     model=model,
-    args=TrainingArguments(output_dir=str(RUN/"_smoke"), max_steps=2,
+    args=TrainingArguments(output_dir=str(CKPT/"_smoke"), max_steps=2,
                    per_device_train_batch_size=1, gradient_accumulation_steps=1,
                    logging_steps=1, bf16=True, gradient_checkpointing=True,
                    remove_unused_columns=False, report_to=[]),
@@ -1366,8 +1386,16 @@ rl_ds = SPLITS["rl_train"].map(lambda ex: {
 processor.tokenizer.padding_side = "left"
 print("processor.tokenizer.padding_side =", processor.tokenizer.padding_side)
 
+# With beta > 0, GRPOTrainer builds its KL reference by adding a disabled
+# adapter named "ref" to the PEFT model. Re-running this cell after a failure
+# finds it already there and PEFT raises "Adapter with name 'ref' already
+# exists", so drop it first and keep the cell idempotent.
+if "ref" in getattr(model, "peft_config", {}):
+    model.delete_adapter("ref")
+    print("removed stale 'ref' adapter from a previous attempt")
+
 _grpo_kwargs = dict(
-    output_dir=str(RUN/"armB_grpo"),
+    output_dir=str(CKPT/"armB_grpo"),
     max_steps=CFG["grpo_steps"],
     per_device_train_batch_size=CFG["grpo_batch"],
     gradient_accumulation_steps=CFG["grpo_grad_accum"],
@@ -1492,7 +1520,7 @@ C_EXAMPLES = build_examples("rl_train", augment=False)
 loggerC = MetricLogger(RUN/"metrics/armC_train_log.jsonl", 0, lambda s: None)
 assert len(C_EXAMPLES) == len(SPLITS["rl_train"]), (
     "arm C must see exactly the documents arm B saw, once each")
-argsC = TrainingArguments(output_dir=str(RUN/"armC_sft"), num_train_epochs=CFG["c_epochs"],
+argsC = TrainingArguments(output_dir=str(CKPT/"armC_sft"), num_train_epochs=CFG["c_epochs"],
                   per_device_train_batch_size=CFG["sft_batch"],
                   gradient_accumulation_steps=CFG["sft_grad_accum"],
                   learning_rate=CFG["c_lr"], lr_scheduler_type="cosine",
