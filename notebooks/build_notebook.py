@@ -1223,6 +1223,63 @@ print(f"\\npre-SFT CER {base_summary['cer']:.4f}  ->  arm A CER {armA_summary['c
       f"({(base_summary['cer']-armA_summary['cer'])/max(base_summary['cer'],1e-9):+.1%})")
 ''')
 
+md("""
+### 8c · Resume after a disconnect
+
+A Colab disconnect destroys the runtime and everything in `/content` — installs,
+Python state, and the Trainer checkpoints under `ckpt_dir`. Drive survives, and
+arm A's adapter plus every metric it produced live there, so **arm A never needs
+retraining.**
+
+To pick up here in a fresh session, run §1, §1a, §2, §3, §4, §5 and §6 — the
+install, token, Drive mount and function definitions have to exist in the
+runtime — then run the cell below **instead of** §7 and §8. Skip the
+`load_base()` call at the end of §5; this replaces it.
+
+Only arm A's weights are recoverable this way. If a *GRPO* run dies partway, its
+optimizer state was in `ckpt_dir` and is gone; restart arm B from this same
+adapter.
+""")
+
+code('''
+ADAPTER = RUN/"adapters/armA"
+assert ADAPTER.exists(), (
+    f"no adapter at {ADAPTER}. If section 7 was interrupted before its save, "
+    f"look for Trainer checkpoints under {CKPT}/armA_sft/checkpoint-* -- those "
+    "are on local disk and only survive while the runtime lives.")
+
+model, processor = load_base(adapter_path=ADAPTER, for_training=True)
+processor.tokenizer.padding_side = "left"   # GRPO's scoring pass needs this
+print("padding_side:", processor.tokenizer.padding_side)
+
+# Rehydrate what sections 9-12 compare against, so the paired statistics still
+# work without re-evaluating anything.
+def _load_json(name):
+    p = RUN/f"metrics/{name}"
+    return json.loads(p.read_text()) if p.exists() else None
+
+def _load_rows(tag):
+    p = RUN/f"metrics/preds_{tag}.jsonl"
+    if not p.exists(): return []
+    return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+base_summary = _load_json("summary_arm0_base.json")
+armA_summary = _load_json("summary_armA.json")
+base_rows, armA_rows = _load_rows("arm0_base"), _load_rows("armA_final")
+
+for label, s in (("pre-SFT", base_summary), ("arm A", armA_summary)):
+    print(f"  {label:<8} " + ("missing" if not s else
+          f"n={s['n']} CER={s['cer']:.4f} sub={s['sub']:.4f} ins={s['ins']:.4f}"))
+print(f"  rows reloaded: baseline {len(base_rows)}, arm A {len(armA_rows)}")
+if base_summary and armA_summary:
+    d = base_summary["cer"] - armA_summary["cer"]
+    print(f"\\narm A improvement: {d:+.4f} CER ({d/max(base_summary['cer'],1e-9):+.1%})")
+if not armA_rows:
+    print("\\n!! no arm A per-document rows -- section 12's paired test needs them.")
+    print("   Re-run 8b (full test eval) before section 12; it is ~15 min and")
+    print("   does not require retraining.")
+''')
+
 # ---------------------------------------------------------------- pass@k gate
 md("""
 ## 9 · GATE — `pass@16` on `rl_train`
