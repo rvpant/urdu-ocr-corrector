@@ -1426,15 +1426,38 @@ def ocr_reward(completions, doc_id=None, **kw):
         rl_reward_log.append(dict(doc_id=doc_id[i] if doc_id else None, reward=r, **b))
     return out
 
-# `image` must be a LIST per sample, even for one image. TRL's pixel-value
-# slicing (split_pixel_values_by_grid / _get_per_token_logps_and_entropies)
-# assumes a per-sample list and mis-slices a bare PIL image, surfacing as
-# "shape mismatch: value tensor of shape [3, N] cannot be broadcast to
-# indexing result of shape [3, M]".
-rl_ds = SPLITS["rl_train"].map(lambda ex: {
-    "prompt": [{"role":"user","content":[{"type":"image"},{"type":"text","text":INSTRUCTION}]}],
-    "image": [encode_image(ex["image"])], "doc_id": ex["doc_id"]},
-    remove_columns=[c for c in SPLITS["rl_train"].column_names if c != "doc_id"])
+# Built with from_list, not .map(). Two separate problems, both schema-level:
+#
+#   1. `image` must be a LIST per sample. TRL's pixel-value slicing
+#      (split_pixel_values_by_grid / _get_per_token_logps_and_entropies) assumes
+#      a per-sample list and mis-slices a bare PIL image -> "shape mismatch:
+#      value tensor of shape [3, N] cannot be broadcast to ... shape [3, M]".
+#   2. .map() over SPLITS["rl_train"] inherits that split's `image` column type,
+#      which is a scalar Image(). Returning a list for the same column name makes
+#      datasets encode each PIL into {"bytes":..,"path":..} and then fail to fit a
+#      dict into a scalar slot -> "only a single or a list of entries is supported
+#      but got type=<class 'dict'>". remove_columns does not help: columns the
+#      function returns are kept, schema and all.
+#
+# from_list starts from no prior schema, so features are inferred from what we
+# actually hand it.
+from datasets import Dataset as HFDataset
+
+rl_ds = HFDataset.from_list([
+    {"prompt": [{"role": "user", "content": [
+         {"type": "image"}, {"type": "text", "text": INSTRUCTION}]}],
+     "image": [encode_image(ex["image"])],
+     "doc_id": ex["doc_id"]}
+    for ex in SPLITS["rl_train"]
+])
+print(rl_ds.features)
+_r0 = rl_ds[0]
+print("image column ->", type(_r0["image"]).__name__,
+      "of", type(_r0["image"][0]).__name__ if isinstance(_r0["image"], (list, tuple)) else "?")
+# transformers' make_flat_list_of_images accepts a single image, a flat list, or
+# a list of lists -- and nothing else. If the element above is a dict rather than
+# an image, datasets handed back encoded bytes and the processor will raise
+# "Could not make a flat list of images".
 
 # Pin left padding for the rest of the run. padding_side() restores on exit, so
 # without this the trainer's scoring pass re-processes prompts with the
