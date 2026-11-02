@@ -1979,16 +1979,56 @@ code('''
 # enable_thinking=False. If that template reasons by default, rollouts reason
 # while the eval does not -- a train/eval mismatch, and reasoning text stripped
 # by clean_output would cost nothing in reward.
+#
+# Qwen disables thinking by emitting a PRE-CLOSED block after the generation
+# prompt:
+#     {%- if enable_thinking is defined and enable_thinking is false %}
+#         {{- '<think>\\n\\n</think>\\n\\n' }}
+# so "off" hands the model an already-closed <think></think> and it goes
+# straight to content. Left on, Qwen3.5 opens a <think> and never closes it --
+# the dangling tag the check below counts.
+#
+# Patching the default onto the processor is version-agnostic: it does not
+# depend on the template's text, and it covers TRL's call sites as well as ours.
+def _force_thinking_off(obj):
+    orig = getattr(obj, "apply_chat_template", None)
+    if orig is None or getattr(orig, "_thinking_patched", False):
+        return False
+    def patched(*a, **kw):
+        kw.setdefault("enable_thinking", False)
+        return orig(*a, **kw)
+    patched._thinking_patched = True
+    obj.apply_chat_template = patched
+    return True
+
+for _obj, _label in ((processor, "processor"), (processor.tokenizer, "tokenizer")):
+    print(f"  {_label}: {'patched' if _force_thinking_off(_obj) else 'already patched'}")
+
 _trl_prompt = processor.apply_chat_template(rl_ds2[0]["prompt"], tokenize=False,
                                              add_generation_prompt=True)
 _dangling = _trl_prompt.count("<think>") - _trl_prompt.count("</think>")
 print("TRL-rendered tail:", repr(_trl_prompt[-200:]))
 print("dangling <think>:", _dangling)
 assert _dangling == 0, (
-    "TRL's rollout prompt leaves thinking ON. Rollouts would reason while the "
-    "eval does not. Fix the template before training -- an unverified mismatch "
-    "here is what made arm B uninterpretable.")
-print("\\nthinking: OFF in TRL's rollout path")
+    f"TRL's rollout prompt still leaves {_dangling} unclosed <think> after "
+    "patching. The template may not accept the enable_thinking kwarg on this "
+    "version -- print processor.chat_template and patch the text directly. Do "
+    "NOT train through this: an unverified mismatch here is what made arm B "
+    "uninterpretable.")
+
+# Closed-and-empty is the intended shape; present is fine, dangling is not.
+print(f"\\nthinking: OFF in TRL's rollout path "
+      f"(<think> blocks: {_trl_prompt.count('<think>')}, all closed)")
+
+# And confirm TRL's render now matches the one the eval path uses, since the
+# whole point is that rollouts and evaluation see the same prompt.
+_our = render_chat(processor, build_messages(rl_ds2[0]["image"]),
+                   add_generation_prompt=True)
+print("matches render_chat (eval path):", _trl_prompt == _our)
+if _trl_prompt != _our:
+    print("  TRL :", repr(_trl_prompt[-120:]))
+    print("  OURS:", repr(_our[-120:]))
+    print("  -> a residual difference here means rollouts and eval still differ")
 ''')
 
 code('''
