@@ -797,9 +797,41 @@ def padding_side(processor, side):
     finally:
         tok.padding_side = prev
 
+def cuda_report(label=""):
+    if not torch.cuda.is_available(): return
+    a, r = torch.cuda.memory_allocated()/2**30, torch.cuda.memory_reserved()/2**30
+    print(f"  CUDA {label}: allocated {a:.1f} GiB, reserved {r:.1f} GiB")
+
+def free_model(*names):
+    """Drop model references and return the memory to CUDA.
+
+    Reassigning `model` is not enough in a notebook: IPython keeps output and
+    history references alive, so the old weights stay resident and
+    empty_cache() cannot reclaim them. Loading a second 4B model this way
+    leaves ~18 GiB allocated before training starts, which is the difference
+    between fitting a GRPO batch and an OOM.
+    """
+    import gc
+    for n in names or ("model", "processor"):
+        globals().pop(n, None)
+    gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+    cuda_report("after free")''')
+
+md("""
+Loading the weights is a **separate cell** on purpose. §8c and §14 reload the
+model with an adapter attached, and if this cell has already put a bare base
+model on the GPU, both are resident at once — about 18 GiB before any training
+batch exists.
+
+**If you are resuming via §8c, skip this cell** (or run `free_model()` after it).
+""")
+
+code('''
 model, processor = load_base()
 print("tokenizer default padding_side:", processor.tokenizer.padding_side,
       "(generation forces left, training forces right)")
+cuda_report("base model loaded")
 print(type(model).__name__, "|", type(processor).__name__)
 ''')
 
@@ -1248,7 +1280,10 @@ assert ADAPTER.exists(), (
     f"look for Trainer checkpoints under {CKPT}/armA_sft/checkpoint-* -- those "
     "are on local disk and only survive while the runtime lives.")
 
+# Release anything §5 already put on the GPU before loading a second copy.
+free_model()
 model, processor = load_base(adapter_path=ADAPTER, for_training=True)
+cuda_report("arm A loaded")
 processor.tokenizer.padding_side = "left"   # GRPO's scoring pass needs this
 print("padding_side:", processor.tokenizer.padding_side)
 
@@ -2032,6 +2067,25 @@ if _trl_prompt != _our:
 ''')
 
 code('''
+import gc
+# A previous attempt's trainer holds optimizer state and KV caches. Drop it by
+# name before rebuilding, or the new one is allocated alongside the old.
+for _n in ("grpo2_trainer", "grpo2_logger"):
+    globals().pop(_n, None)
+gc.collect()
+if torch.cuda.is_available(): torch.cuda.empty_cache()
+cuda_report("before trainer")
+
+# Check the starting point. One 4B model plus a LoRA adapter is ~9 GiB. Much
+# above that means a second copy is resident -- usually the bare base model from
+# section 5's load cell -- and the GRPO batch will not fit. Fix that rather than
+# shrinking the batch, which costs group size for no reason.
+_alloc = torch.cuda.memory_allocated()/2**30 if torch.cuda.is_available() else 0
+if _alloc > 14:
+    print(f"\\n!! {_alloc:.1f} GiB allocated before training; expected ~9.")
+    print("   Restart, skip section 5's load cell (or call free_model() after")
+    print("   it), then re-run section 8c so only one model is resident.")
+
 processor.tokenizer.padding_side = "left"      # scoring pass must match training
 if "ref" in getattr(model, "peft_config", {}):
     model.delete_adapter("ref")                # beta>0 re-adds it; cell stays idempotent
