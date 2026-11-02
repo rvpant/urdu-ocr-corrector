@@ -1753,6 +1753,405 @@ adapters/  armA/  armB/  armC/
 ```
 """)
 
+# ================================================================ section 14
+md("""
+---
+
+# 14 · Arm B′ — GRPO with a discrete line reward
+
+Self-contained retry of the RL arm. **Nothing above this needs re-running except
+setup and §8c**; the cell list is in §14a.
+
+## Why arm B failed, and what changed
+
+Arm B reached CER 1.4077 with `ins` 5.2160 and a degenerate `usr` token loop. The
+rollout log shows that was *not* an RL collapse — reward rose from −0.185 to
+**+0.928**, and the final rollouts scored CER 0.059 at ratio 1.038. The policy
+worked. It was evaluated on inputs it had never seen:
+
+| | images | CER |
+|---|---|---:|
+| arm B final rollouts | squared 1024×1024 | 0.059 |
+| arm B held-out eval | native aspect, `encode_image` | 1.4077 |
+
+GRPO spent 60 steps re-adapting the policy to a squared-image transform
+introduced to work around a TRL shape error, and the eval then fed it native
+aspect ratios. Same weights, different distribution.
+
+Four changes here:
+
+1. **No image transform.** `encode_image` is untouched, so rollouts and eval see
+   identical inputs and arm A's 0.0315 stays a valid comparison. The uniform
+   image-token count TRL needs comes from `batch == num_generations`, which puts
+   one document's rollout group in each forward pass.
+2. **Discrete reward: F1 over exact line matches.** Measured on arm C's
+   predictions, **46.9%** of ground-truth lines come back exactly right (per-doc
+   median 0.477, p10 0.250, p90 0.750, only 6/100 documents degenerate). A
+   Bernoulli variable at p≈0.47 is at maximum variance, the same regime as the
+   one successful prime-rl reference run (56.25%). One line of twelve differing
+   between rollouts moves F1 by 0.083; the same difference moves page CER by
+   ~0.005, which was below its own noise floor.
+3. **No reward plateau.** F1 is bounded in [0,1] with no cap, so over-generation
+   is never free — extra lines cut precision directly. That was the mechanism
+   behind RL-1b, RL-2 and arm B, and it removes the need for a length penalty
+   competing with the primary term.
+4. **Start from arm A, not arm C.** Arm C trained on `rl_train`; RL on the same
+   documents would optimize against memorised data. Starting from arm A keeps
+   B′ vs C a fair comparison at a fixed data budget.
+""")
+
+md("""
+## 14a · What to run
+
+From a cold runtime, in order:
+
+| cells | what |
+|---|---|
+| 2 | install (also removes torchao) |
+| 4, 5 | HF token + dataset access |
+| 6 | imports, `seed_all` |
+| 8 | `CFG`, Drive mount, `RUN` / `CKPT` |
+| 10 | metrics: `normalize`, `cer_breakdown`, `clean_output` |
+| 12, 13 | `SPLITS`, `encode_image` (~3 min) |
+| 15 | `load_base`, `render_chat`, `padding_side` — **let the trailing `load_base()` run or interrupt it; §8c reloads anyway** |
+| 19 | `generate_batch`, `evaluate` |
+| 27 | `MetricLogger`, `VLMOcrDataset` (definitions only, no training) |
+| **39** | **§8c — loads arm A's adapter from Drive** |
+| then | every cell in §14 below, in order |
+
+Skip 17, 21, 23, 25 (probes and the baseline, already measured), 28–37 (arm A
+training), and 41–51 (the old gate, arm B, arm C).
+""")
+
+code('''
+from collections import Counter
+
+def line_f1(pred, gt):
+    """F1 over exact line matches, as a multiset so repeated lines count once each.
+
+    Precision is what makes this safe: emitting extra lines to catch more
+    matches lowers it, so over-generation costs reward instead of being free.
+    That is the property every previous reward here lacked -- CER capped at 1.5
+    went flat past ~2.5x length, and the policy ran away into the plateau.
+    """
+    g = Counter(x for x in (normalize(l) for l in (gt or "").splitlines()) if x)
+    p = Counter(x for x in (normalize(l) for l in (pred or "").splitlines()) if x)
+    hits = sum((g & p).values())
+    n_g, n_p = sum(g.values()), sum(p.values())
+    if n_g == 0 or n_p == 0 or hits == 0:
+        return 0.0
+    prec, rec = hits / n_p, hits / n_g
+    return 2 * prec * rec / (prec + rec)
+
+# Behaviour checks before it is wired to a reward.
+_gt3 = "alpha\\nbeta\\ngamma"
+for _name, _hyp, _want in [
+    ("perfect",        "alpha\\nbeta\\ngamma", 1.0),
+    ("one line wrong", "alpha\\nbeta\\nGAMMA", 2*(2/3)*(2/3)/((2/3)+(2/3))),
+    ("one missing",    "alpha\\nbeta",         2*1.0*(2/3)/(1.0+(2/3))),
+    ("duplicated",     "alpha\\nalpha\\nbeta\\ngamma", 2*(3/4)*1.0/((3/4)+1.0)),
+    ("padded garbage", "alpha\\nbeta\\ngamma\\nxx\\nyy\\nzz", 2*0.5*1.0/(0.5+1.0)),
+    ("empty",          "",                     0.0),
+]:
+    _got = line_f1(_hyp, _gt3)
+    print(f"  {_name:<16} F1={_got:.3f} expected {_want:.3f} "
+          f"{'OK' if abs(_got-_want) < 1e-6 else 'MISMATCH'}")
+print("\\nnote the 'padded garbage' row: recall stays 1.0 but F1 drops to 0.667,")
+print("which is the plateau fix -- extra output is penalised, not free.")
+''')
+
+md("""
+## 14b · Gate — within-group F1 spread
+
+The 46.9% figure says the reward is well positioned *across* documents. It does
+not say rollouts differ *on the same* document, and that within-group spread is
+what GRPO actually consumes.
+
+This is the same probe that predicted every previous failure, in F1 units.
+Higher F1 is better, so the useful direction is now best-of-k **above** greedy.
+
+| within-group sd | action |
+|---|---|
+| ≥ 0.08 | real signal → run it |
+| 0.03 – 0.08 | marginal; still better than the 0.028 CER spread ever was |
+| < 0.03 | the same dead end in different units → **stop here** |
+""")
+
+code('''
+@torch.no_grad()
+def f1_gate(model, processor, split="rl_train", k=8, n_docs=10, temperature=0.7):
+    ds, rows = SPLITS[split], []
+    for i in range(min(n_docs, len(ds))):
+        ex = ds[i]; im = encode_image(ex["image"])
+        greedy = generate_batch(model, processor, [im], temperature=0.0)[0]
+        samples = []
+        for _ in range(k):
+            samples += generate_batch(model, processor, [im], temperature=temperature)
+        f = [line_f1(s, ex["ground_truth"]) for s in samples]
+        g = line_f1(greedy, ex["ground_truth"])
+        rows.append(dict(doc_id=ex["doc_id"], greedy=g, mean=float(np.mean(f)),
+                         best=float(np.max(f)), worst=float(np.min(f)),
+                         sd=float(np.std(f)), n_better=int(sum(x > g for x in f))))
+        print(f"  {i+1}/{n_docs} greedy={g:.3f} mean={np.mean(f):.3f} "
+              f"best={np.max(f):.3f} sd={np.std(f):.3f}   ", end="\\r")
+    d = pd.DataFrame(rows)
+    res = dict(k=k, n_docs=len(d), greedy=float(d["greedy"].mean()),
+               mean=float(d["mean"].mean()), best=float(d["best"].mean()),
+               within_group_sd=float(d["sd"].mean()),
+               best_minus_greedy=float(d["best"].mean() - d["greedy"].mean()),
+               frac_rollouts_better=float(d["n_better"].sum() / (len(d) * k)))
+    d.to_csv(RUN/"metrics/f1_gate_rl_train.csv", index=False)
+    jdump(res, RUN/"metrics/f1_gate_rl_train.json")
+    return res, d
+
+f1g, f1g_df = f1_gate(model, processor)
+print(f"""
+greedy F1          {f1g['greedy']:.4f}
+mean-of-{f1g['k']} F1      {f1g['mean']:.4f}
+best-of-{f1g['k']} F1      {f1g['best']:.4f}
+WITHIN-GROUP SD    {f1g['within_group_sd']:.4f}   <- the gate
+best - greedy      {f1g['best_minus_greedy']:+.4f}
+rollouts > greedy  {f1g['frac_rollouts_better']:.1%}
+""")
+_sd = f1g["within_group_sd"]
+print("VERDICT:", "RUN -- real within-group signal" if _sd >= 0.08
+      else "MARGINAL -- proceed only if you want the measurement" if _sd >= 0.03
+      else "STOP -- spread below the noise floor, same dead end in new units")
+''')
+
+md("""
+## 14c · GRPO setup
+
+Every fix from the arm B post-mortem, in one place.
+""")
+
+code('''
+from trl import GRPOConfig, GRPOTrainer
+
+GT_BY_ID2 = {ex["doc_id"]: ex["ground_truth"] for ex in SPLITS["rl_train"]}
+rl2_log, _think_seen = [], 0
+
+def line_f1_reward(completions, doc_id=None, **kw):
+    """Primary reward. Raises rather than scoring against an empty reference.
+
+    The original ocr_reward fell back to `gt = ""` when doc_id was absent, which
+    silently makes every reward a constant -- zero advantage, no learning, and no
+    error message. If TRL ever stops forwarding dataset columns, fail loudly.
+    """
+    global _think_seen
+    if doc_id is None:
+        raise RuntimeError(
+            "TRL did not forward `doc_id`; the reward cannot find its ground "
+            "truth. Check that rl_ds still has a doc_id column.")
+    out = []
+    for i, c in enumerate(completions):
+        raw = c if isinstance(c, str) else c[0]["content"]
+        if "<think>" in (raw or ""):
+            _think_seen += 1
+        text = clean_output(raw)
+        gt = GT_BY_ID2[doc_id[i]]
+        r = line_f1(text, gt)
+        out.append(float(r))
+        b = cer_breakdown(gt, text)       # weight 0, monitoring only
+        rl2_log.append(dict(doc_id=doc_id[i], reward=r, **b))
+    return out
+
+# Bare PIL per sample, built with from_list.
+#   - A LIST per sample makes TRL's own wrapping produce [[[PIL]]], three levels
+#     deep, and make_flat_list_of_images accepts at most two.
+#   - .map() over SPLITS inherits that split's scalar Image() feature, so a
+#     returned list gets encoded to dicts and fails. from_list infers fresh.
+from datasets import Dataset as HFDataset
+
+rl_ds2 = HFDataset.from_list([
+    {"prompt": [{"role": "user", "content": [
+         {"type": "image"}, {"type": "text", "text": INSTRUCTION}]}],
+     "image": encode_image(ex["image"]),
+     "doc_id": ex["doc_id"]}
+    for ex in SPLITS["rl_train"]
+])
+print(rl_ds2)
+print("image ->", type(rl_ds2[0]["image"]).__name__, rl_ds2[0]["image"].size)
+''')
+
+code('''
+# TRL renders `prompt` with the processor's own chat template and never passes
+# enable_thinking=False. If that template reasons by default, rollouts reason
+# while the eval does not -- a train/eval mismatch, and reasoning text stripped
+# by clean_output would cost nothing in reward.
+_trl_prompt = processor.apply_chat_template(rl_ds2[0]["prompt"], tokenize=False,
+                                             add_generation_prompt=True)
+_dangling = _trl_prompt.count("<think>") - _trl_prompt.count("</think>")
+print("TRL-rendered tail:", repr(_trl_prompt[-200:]))
+print("dangling <think>:", _dangling)
+assert _dangling == 0, (
+    "TRL's rollout prompt leaves thinking ON. Rollouts would reason while the "
+    "eval does not. Fix the template before training -- an unverified mismatch "
+    "here is what made arm B uninterpretable.")
+print("\\nthinking: OFF in TRL's rollout path")
+''')
+
+code('''
+processor.tokenizer.padding_side = "left"      # scoring pass must match training
+if "ref" in getattr(model, "peft_config", {}):
+    model.delete_adapter("ref")                # beta>0 re-adds it; cell stays idempotent
+    print("removed stale 'ref' adapter")
+
+_g2 = dict(
+    output_dir=str(CKPT/"armB2_grpo"),
+    max_steps=60,
+    # batch == num_generations puts ONE document's rollout group in each forward
+    # pass, so every image in a batch is the same image and the token count is
+    # uniform. That is what the shape mismatch was about -- 16 images of two
+    # different sizes in one slice -- and it is why no image transform is needed.
+    per_device_train_batch_size=8,
+    num_generations=8,
+    gradient_accumulation_steps=8,             # raise this for effective batch
+    learning_rate=5e-6,
+    beta=0.04,                                 # KL anchor to the arm A policy
+    temperature=0.7,
+    max_completion_length=1536,                # GT max is 1,563 tokens; p90 is 726
+    logging_steps=1, save_steps=20, save_total_limit=2,
+    bf16=True, gradient_checkpointing=True, report_to=[], seed=CFG["seed"],
+)
+
+# TRL defaults to scale_rewards="group", dividing advantages by the group std.
+# prime-rl mean-centres only. With a low-variance reward the division turns
+# eps-scale noise into O(1) advantages, and lowering the shaping coefficient
+# provably does not help because z-scoring cancels it. loss_type="dr_grpo"
+# does NOT disable this; it is a separate knob.
+import inspect
+if "scale_rewards" in set(inspect.signature(GRPOConfig.__init__).parameters):
+    for _v in ("none", False):
+        try:
+            grpo2_args = GRPOConfig(scale_rewards=_v, **_g2)
+            print(f"scale_rewards={_v!r} -> group-std scaling OFF"); break
+        except Exception as e:
+            print(f"scale_rewards={_v!r} rejected: {type(e).__name__}")
+    else:
+        grpo2_args = GRPOConfig(**_g2); print("!! group-std scaling is ON")
+else:
+    grpo2_args = GRPOConfig(**_g2); print("!! no scale_rewards knob in this TRL")
+
+grpo2_logger = MetricLogger(RUN/"metrics/armB2_train_log.jsonl", 0, lambda s: None)
+grpo2_trainer = GRPOTrainer(model=model, args=grpo2_args, train_dataset=rl_ds2,
+                            reward_funcs=[line_f1_reward], processing_class=processor,
+                            callbacks=[grpo2_logger])
+print("\\nconfigured. If this OOMs, drop num_generations and "
+      "per_device_train_batch_size together -- they must stay equal.")
+''')
+
+md("""
+## 14d · Train
+
+Watch **reward**, not loss. GRPO's loss is a surrogate whose advantages are
+mean-centred within each group, so it hovers near zero and fluctuates regardless
+of policy quality — a rising loss means nothing here.
+
+The first thing to check is that step-1 rollout reward is near the gate's
+`mean-of-8` figure. Arm B's rollouts opened at `ins` 7.4 when arm A's greedy was
+0.0094, and that 300× discrepancy was the signal that the rollout path differed
+from the eval path. It was visible at step 1 and went unread.
+""")
+
+code('''
+t0 = time.time()
+grpo2_trainer.train()
+print(f"\\nGRPO done in {(time.time()-t0)/60:.1f} min")
+
+model.save_pretrained(RUN/"adapters/armB2")
+d2 = pd.DataFrame(rl2_log)
+d2.to_csv(RUN/"metrics/armB2_rollout_rewards.csv", index=False)
+pd.DataFrame(grpo2_logger.history).to_csv(RUN/"metrics/armB2_train_log.csv", index=False)
+
+k = max(1, len(d2)//10)
+print(f"rollouts: {len(d2)}   <think> seen in {_think_seen} completions")
+print(f"first decile reward {d2['reward'][:k].mean():.3f} -> "
+      f"last decile {d2['reward'][-k:].mean():.3f}")
+print(f"first decile ratio  {d2['ratio'][:k].mean():.3f} -> "
+      f"last decile {d2['ratio'][-k:].mean():.3f}")
+print(f"first decile cer    {d2['cer'][:k].mean():.3f} -> "
+      f"last decile {d2['cer'][-k:].mean():.3f}")
+''')
+
+md("""
+## 14e · Held-out evaluation and the comparison that matters
+
+Same `evaluate()`, same `encode_image`, same test split as arms A and C — so
+these numbers are directly comparable, which was exactly what arm B's were not.
+
+**B′ vs C is the experiment.** Both consumed the same 250 `rl_train` documents
+starting from arm A; one by reinforcement, one by supervision.
+""")
+
+code('''
+model.eval()
+armB2_summary, armB2_rows = evaluate(model, processor, "test", tag="armB2_final")
+jdump(armB2_summary, RUN/"metrics/summary_armB2.json")
+
+def _load(name):
+    p = RUN/f"metrics/{name}"
+    return json.loads(p.read_text()) if p.exists() else None
+
+_rows = []
+for label, s in (("base", _load("summary_arm0_base.json")),
+                 ("A: SFT", _load("summary_armA.json")),
+                 ("C: SFT+SFT", _load("summary_armC.json")),
+                 ("B2: SFT+RL(F1)", armB2_summary)):
+    if s: _rows.append(dict(arm=label, **{k: s[k] for k in
+                       ("n","cer","sub","dele","ins","ratio","empty")}))
+tbl = pd.DataFrame(_rows)
+print(tbl.round(4).to_string(index=False))
+tbl.to_csv(RUN/"metrics/arm_summaries_v2.csv", index=False)
+
+# Paired per-document comparison; reuses `paired` from section 12 when present.
+armA_rows = [json.loads(l) for l in
+             (RUN/"metrics/preds_armA_final.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+armC_p = RUN/"metrics/preds_armC_final.jsonl"
+armC_rows = ([json.loads(l) for l in armC_p.read_text(encoding="utf-8").splitlines() if l.strip()]
+             if armC_p.exists() else [])
+
+def _paired(a_rows, b_rows, label):
+    from scipy import stats
+    a = {r["doc_id"]: r["cer"] for r in a_rows}
+    b = {r["doc_id"]: r["cer"] for r in b_rows}
+    ids = sorted(set(a) & set(b))
+    da = np.array([a[i] for i in ids]); db = np.array([b[i] for i in ids])
+    diff = da - db
+    t = stats.ttest_rel(da, db); w = stats.wilcoxon(da, db)
+    d = diff.mean() / diff.std(ddof=1) if diff.std(ddof=1) > 0 else 0.0
+    print(f"{label:<28} n={len(ids)} cer_a={da.mean():.4f} cer_b={db.mean():.4f} "
+          f"delta={diff.mean():+.4f} improved={100*(diff>0).mean():.0f}% "
+          f"d={d:+.3f} t_p={t.pvalue:.4g} w_p={w.pvalue:.4g}")
+
+print()
+_paired(armA_rows, armB2_rows, "armA -> armB2 (RL)")
+if armC_rows:
+    _paired(armC_rows, armB2_rows, "armC -> armB2 (RL vs SFT)")
+''')
+
+md("""
+## 14f · Reading the result
+
+| outcome | interpretation |
+|---|---|
+| B′ below C, significant | RL adds something supervision on the same data does not. The discrete reward was the missing piece. |
+| B′ ≈ C | RL matches supervision at equal data budget — no advantage, but no longer a failure. |
+| B′ ≈ A | RL did nothing; the gate's prior was right. |
+| B′ well above A | degradation. Check `ratio` and `ins` first: if they rose, the plateau is back despite F1. |
+
+Check the decomposition either way. The remaining error in arm C is
+`sub 0.0047 / del 0.0155 / ins 0.0087`, so **deletions are the largest
+component** and the line reward targets them directly — a dropped line costs
+recall. If B′ improves, deletions falling is the mechanism to confirm.
+
+A note on what this run can and cannot settle. A null result here is informative
+in a way arm B's was not: same inputs, same eval, a reward whose resolution was
+measured in advance, and a gate reading recorded before training. A null would
+say RL has nothing to add *at this performance level* — not that the earlier
+setup was broken, which is all arm B established.
+""")
+
 nb = {
     "cells": cells,
     "metadata": {
