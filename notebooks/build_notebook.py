@@ -802,20 +802,37 @@ def cuda_report(label=""):
     a, r = torch.cuda.memory_allocated()/2**30, torch.cuda.memory_reserved()/2**30
     print(f"  CUDA {label}: allocated {a:.1f} GiB, reserved {r:.1f} GiB")
 
-def free_model(*names):
+def free_model(*names, reset_accelerate=True):
     """Drop model references and return the memory to CUDA.
 
-    Reassigning `model` is not enough in a notebook: IPython keeps output and
-    history references alive, so the old weights stay resident and
-    empty_cache() cannot reclaim them. Loading a second 4B model this way
-    leaves ~18 GiB allocated before training starts, which is the difference
-    between fitting a GRPO batch and an OOM.
+    Reassigning `model` is not enough in a notebook. Three things hold the old
+    weights alive, and all three have to go:
+
+      1. the global name -- popped here;
+      2. IPython's output history (``Out``, ``_``, ``__``) -- `%reset -f out`,
+         which a function cannot run, so do it in a cell if this is not enough;
+      3. Accelerate's ``AcceleratorState``, a module-level singleton that
+         ``Trainer`` populates with the prepared model and optimizer. This one
+         is the reason popping a failed trainer still left ~24 GiB allocated.
+
+    Prints the count of live top-level models so you can tell whether anything
+    is still resident rather than guessing from the byte totals.
     """
     import gc
     for n in names or ("model", "processor"):
         globals().pop(n, None)
+    if reset_accelerate:
+        try:
+            from accelerate.state import AcceleratorState
+            AcceleratorState._reset_state(reset_partial_state=True)
+        except Exception:
+            pass
     gc.collect()
     if torch.cuda.is_available(): torch.cuda.empty_cache()
+    live = [o for o in gc.get_objects()
+            if isinstance(o, torch.nn.Module) and hasattr(o, "config")]
+    print(f"  live top-level models: {len(live)}"
+          + (f" -> {[type(o).__name__ for o in live][:4]}" if live else ""))
     cuda_report("after free")''')
 
 md("""
@@ -1838,24 +1855,40 @@ Four changes here:
 md("""
 ## 14a · What to run
 
-From a cold runtime, in order:
+From a cold runtime, in order. Run the §5 **definitions** cell but **skip the
+cell right after it that calls `load_base()`** — that puts a bare base model on
+the GPU, and §8c then loads a second one. Two 4B models is ~18 GiB resident
+before any training batch exists, and that was the cause of three OOMs.
 
 | cells | what |
 |---|---|
-| 2 | install (also removes torchao) |
-| 4, 5 | HF token + dataset access |
-| 6 | imports, `seed_all` |
-| 8 | `CFG`, Drive mount, `RUN` / `CKPT` |
-| 10 | metrics: `normalize`, `cer_breakdown`, `clean_output` |
-| 12, 13 | `SPLITS`, `encode_image` (~3 min) |
-| 15 | `load_base`, `render_chat`, `padding_side` — **let the trailing `load_base()` run or interrupt it; §8c reloads anyway** |
-| 19 | `generate_batch`, `evaluate` |
-| 27 | `MetricLogger`, `VLMOcrDataset` (definitions only, no training) |
-| **39** | **§8c — loads arm A's adapter from Drive** |
-| then | every cell in §14 below, in order |
+| install | also removes torchao |
+| HF token + dataset check | splits are private |
+| imports, `seed_all` | |
+| `CFG`, Drive mount, `RUN` / `CKPT` | prints free space |
+| metrics | `normalize`, `cer_breakdown`, `clean_output` |
+| `SPLITS`, `encode_image` | ~3 min |
+| §5 model/LoRA **definitions** | `load_base`, `render_chat`, `padding_side`, `free_model` |
+| ~~§5 load cell~~ | **SKIP — this is the OOM** |
+| `generate_batch`, `evaluate` | |
+| `MetricLogger`, `VLMOcrDataset` | definitions only |
+| **§8c** | **loads arm A's adapter — expect `~9 GiB` allocated** |
+| then | every cell in §14, in order |
 
-Skip 17, 21, 23, 25 (probes and the baseline, already measured), 28–37 (arm A
-training), and 41–51 (the old gate, arm B, arm C).
+Skip the §6 probes and the §6b baseline (already measured), all of §7–§8b (arm A
+training), and §9–§12 (the old gate, arm B, arm C).
+
+### Memory, if it OOMs anyway
+
+The GRPO config below is sized for a single 40 GB A100 and the arithmetic is in
+the comment there. Two things to check before changing it:
+
+- **§8c should report ~9 GiB.** Much more means a second model is resident.
+- **A failed run poisons memory.** Popping the trainer is not enough; Accelerate's
+  `AcceleratorState` singleton still holds the prepared model. `free_model()`
+  resets it and prints the live model count, but if that does not get you back
+  under 1 GiB, restart the runtime rather than fighting it — and edit the config
+  *before* the next attempt instead of discovering the same ceiling again.
 """)
 
 code('''
@@ -2091,6 +2124,19 @@ if "ref" in getattr(model, "peft_config", {}):
     model.delete_adapter("ref")                # beta>0 re-adds it; cell stays idempotent
     print("removed stale 'ref' adapter")
 
+# Sized for a single 40 GB A100. GRPO materialises a logits tensor of
+# batch x seq x vocab, and Qwen's vocab is 151,936, so that tensor dominates:
+#
+#   num_gen  completion  worst seq   logits (bf16)
+#      8        1536       5,632       13.7 GB   <- OOMs on a 40 GB card
+#      8        1024       5,120       12.4 GB   <- OOMs
+#      4        1536       5,632        6.8 GB   <- marginal
+#      4        1024       5,120        6.2 GB   <- fits
+#      2        1024       5,120        3.1 GB
+#
+# Worst case because image tokens run 400-4,096 (capped by max_image_tokens),
+# so a large page plus a long completion is ~5,600 tokens. On an 80 GB card
+# raise to 8 / 1536 and set beta back to 0.04.
 _g2 = dict(
     output_dir=str(CKPT/"armB2_grpo"),
     max_steps=60,
@@ -2098,13 +2144,21 @@ _g2 = dict(
     # pass, so every image in a batch is the same image and the token count is
     # uniform. That is what the shape mismatch was about -- 16 images of two
     # different sizes in one slice -- and it is why no image transform is needed.
-    per_device_train_batch_size=8,
-    num_generations=8,
-    gradient_accumulation_steps=8,             # raise this for effective batch
+    # These two must stay equal.
+    per_device_train_batch_size=4,
+    num_generations=4,
+    gradient_accumulation_steps=16,            # raise this for effective batch
     learning_rate=5e-6,
-    beta=0.04,                                 # KL anchor to the arm A policy
+    # beta=0 skips the reference forward entirely (TRL guards it with
+    # `if self.beta != 0.0`), which is the largest single memory saving
+    # available. The cost is no KL anchor to the arm A policy. That is more
+    # tolerable than it would have been with the capped-CER reward: F1 is
+    # bounded in [0,1] with no plateau, so there is no region where unbounded
+    # drift pays. Watch `ratio` in the rollout log -- past ~1.3 means the
+    # policy is drifting toward over-generation and nothing is holding it back.
+    beta=0.0,
     temperature=0.7,
-    max_completion_length=1536,                # GT max is 1,563 tokens; p90 is 726
+    max_completion_length=1024,                # GT p90 is 726 tokens, max 1,563
     logging_steps=1, save_steps=20, save_total_limit=2,
     bf16=True, gradient_checkpointing=True, report_to=[], seed=CFG["seed"],
 )
